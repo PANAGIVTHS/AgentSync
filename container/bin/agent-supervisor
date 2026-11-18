@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Keeps one `claude remote-control` running per shared repo, each in a tmux
+# window, so every repo shows up in the Claude Code web UI and app.
+set -u
+SESSION=${AGENT_TMUX_SESSION:-agent}
+WORK=${AGENT_WORK:-/work}
+log() { printf '[supervisor %s] %s\n' "$(date +%H:%M:%S)" "$*"; }
+logged_in() { claude auth status 2>/dev/null | grep -q '"loggedIn": *true'; }
+windows() { tmux list-windows -t "$SESSION" -F '#W' 2>/dev/null; }
+
+tmux has-session -t "$SESSION" 2>/dev/null || tmux new-session -d -s "$SESSION" -n shell -c "$WORK"
+warned=0
+while true; do
+  if logged_in; then
+    warned=0
+    for dir in "$WORK"/*/; do
+      [[ -d "$dir/.git" ]] || continue
+      name=$(basename "$dir")
+      if ! windows | grep -qxF "rc-$name"; then
+        log "starting Remote Control for $name"
+        # A persistent server: start new sessions for this repo from claude.ai/code.
+        # If it exits, the window closes after 30 s and the loop starts it again.
+        tmux new-window -d -t "$SESSION" -n "rc-$name" -c "$dir" \
+          "claude remote-control --name '$name'; echo '[remote-control exited; restarting in 30 s]'; sleep 30"
+      fi
+    done
+    for w in $(windows | grep '^rc-' || true); do
+      [[ -d "$WORK/${w#rc-}" ]] || { log "stopping ${w#rc-} (unshared)"; tmux kill-window -t "$SESSION:=$w"; }
+    done
+  elif (( ! warned )); then
+    log "not logged in yet: run 'agent login' on the host"
+    warned=1
+  fi
+  sleep "${AGENT_POLL_SECONDS:-15}"
+done

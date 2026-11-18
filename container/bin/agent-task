@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+"""Git helpers behind the /task, /status and /handoff skills.
+
+Doing these steps in a script keeps them identical every time and costs a few
+lines of output instead of many tool calls. Run from inside /work/<project>.
+"""
+import argparse
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+HANDOFFS = Path(os.environ.get("AGENT_HANDOFFS", "/handoffs"))
+
+
+def die(msg: str) -> None:
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def git(*args, check=True) -> str:
+    p = subprocess.run(["git", *args], capture_output=True, text=True)
+    if check and p.returncode:
+        die(f"git {' '.join(args)} failed: {(p.stderr or p.stdout).strip()}")
+    return p.stdout.strip()
+
+
+def ok(*args) -> bool:
+    return subprocess.run(["git", *args], capture_output=True).returncode == 0
+
+
+def root() -> Path:
+    top = git("rev-parse", "--show-toplevel", check=False)
+    if not top:
+        die("not inside a project. cd /work/<project> first")
+    return Path(top)
+
+
+def slug(name: str) -> str:
+    s = re.sub(r"[^a-z0-9._-]+", "-", name.lower().removeprefix("agent/")).strip("-.")
+    if not s:
+        die(f"invalid task name: {name!r}")
+    return s[:60]
+
+
+def default_base() -> str:
+    head = git("symbolic-ref", "-q", "--short", "refs/remotes/desktop/HEAD", check=False)
+    if head:
+        return head.removeprefix("desktop/")
+    for b in ("main", "master"):
+        if ok("rev-parse", "--verify", "-q", f"refs/remotes/desktop/{b}"):
+            return b
+    die("can't tell the default branch; pass --from <branch>")
+
+
+def base_of(branch: str) -> str:
+    return git("config", "--get", f"branch.{branch}.agentBase", check=False) or default_base()
+
+
+def fetch() -> None:
+    if not ok("fetch", "--prune", "--quiet", "desktop"):
+        print("warning: could not fetch the user's latest commits", file=sys.stderr)
+
+
+def behind_ahead(base_ref: str, branch: str) -> tuple[int, int]:
+    left, right = git("rev-list", "--left-right", "--count", f"{base_ref}...{branch}").split()
+    return int(left), int(right)
+
+
+def handoff_file(task: str) -> Path:
+    return HANDOFFS / root().name / f"{task}.md"
+
+
+def cmd_start(a) -> None:
+    root()
+    fetch()
+    task = slug(a.name)
+    branch = f"agent/{task}"
+    current = git("branch", "--show-current", check=False)
+    if current != branch and git("status", "--porcelain"):
+        if not current.startswith("agent/"):
+            die(f"uncommitted changes on {current or 'detached HEAD'}. Commit them on an agent/ branch or discard them")
+        git("add", "-A")
+        git("commit", "--quiet", "-m", f"wip: autosave before switching to {branch}")
+        print(f"autosaved uncommitted work on {current}")
+    if ok("rev-parse", "--verify", "-q", f"refs/heads/{branch}"):
+        if current != branch:
+            git("switch", "--quiet", branch)
+        base = base_of(branch)
+        behind, ahead = behind_ahead(f"desktop/{base}", branch)
+        print(f"resumed {branch} (base {base}: {ahead} commits ahead, {behind} behind the user's latest)")
+        log = git("log", "--oneline", "-3", branch)
+        if log:
+            print(log)
+    else:
+        base = a.base or default_base()
+        if not ok("rev-parse", "--verify", "-q", f"refs/remotes/desktop/{base}"):
+            have = git("for-each-ref", "--format=%(refname:lstrip=3)", "refs/remotes/desktop/").split()
+            die(f"no user branch {base!r}. Available: {', '.join(b for b in have if b != 'HEAD')}")
+        git("switch", "--quiet", "--no-track", "-c", branch, f"desktop/{base}")
+        git("config", f"branch.{branch}.agentBase", base)
+        print(f"created {branch} from the user's {base} ({git('rev-parse', '--short', 'HEAD')})")
+    if handoff_file(task).exists():
+        print(f"earlier handoff: {handoff_file(task)}")
+
+
+def cmd_status(_a) -> None:
+    root()
+    fetch()
+    current = git("branch", "--show-current", check=False)
+    branches = git("for-each-ref", "--format=%(refname:short)", "refs/heads/agent/").split()
+    if not branches:
+        print("no tasks yet. Start one: /task <name> <goal>")
+    for b in branches:
+        base = base_of(b)
+        task = b.removeprefix("agent/")
+        if ok("rev-parse", "--verify", "-q", f"refs/remotes/desktop/{base}"):
+            behind, ahead = behind_ahead(f"desktop/{base}", b)
+            state = (f"{ahead} ahead, {behind} behind {base}" if ahead
+                     else f"nothing new vs {base} (merged or empty)")
+        else:
+            state = f"base {base} no longer exists"
+        mark = "*" if b == current else " "
+        ready = "handoff written" if handoff_file(task).exists() else "no handoff"
+        print(f"{mark} {b:<28} {state:<28} {ready}")
+    wip = git("for-each-ref", "--format=%(refname:short)", "refs/remotes/desktop-wip/").split()
+    if wip:
+        print("user's uncommitted work: " + ", ".join(wip))
+    if git("status", "--porcelain"):
+        print("working tree has uncommitted changes")
+
+
+def cmd_handoff(_a) -> None:
+    top = root()
+    branch = git("branch", "--show-current", check=False)
+    if not branch.startswith("agent/"):
+        die("not on a task branch. Use /task first")
+    if git("status", "--porcelain"):
+        die("uncommitted changes. Commit them first (git add -A && git commit -m '...')")
+    fetch()
+    base = base_of(branch)
+    base_ref = f"desktop/{base}"
+    if not ok("merge-base", "--is-ancestor", base_ref, "HEAD"):
+        p = subprocess.run(["git", "rebase", "--quiet", base_ref], capture_output=True, text=True)
+        if p.returncode:
+            files = git("diff", "--name-only", "--diff-filter=U", check=False)
+            print(f"rebase onto the user's latest {base} hit conflicts in:\n{files}\n"
+                  "Resolve them, `git add` the files, `git rebase --continue`, then run this again.")
+            sys.exit(1)
+        print(f"rebased onto the user's latest {base}")
+    task = branch.removeprefix("agent/")
+    f = handoff_file(task)
+    f.parent.mkdir(parents=True, exist_ok=True)
+    commits = git("log", "--oneline", "--no-decorate", f"{base_ref}..HEAD").splitlines()
+    stat = git("diff", "--stat", f"{base_ref}...HEAD").splitlines()
+    print(f"branch {branch} · base {base} · head {git('rev-parse', '--short', 'HEAD')} · {len(commits)} commits")
+    for c in commits[:15]:
+        print(f"  {c}")
+    if len(commits) > 15:
+        print(f"  … {len(commits) - 15} more")
+    if stat:
+        print(f"  {stat[-1].strip()}")
+    action = "Update" if f.exists() else "Write"
+    print(f"\n{action} the handoff at {f} with these headings (under 30 lines):\n"
+          f"# {task}\n## Summary\n## Changes\n## Verification\n## Risks and follow-ups")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(prog="agent-task")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("start", help="create or resume agent/<name>")
+    s.add_argument("name")
+    s.add_argument("--from", dest="base", help="user branch to start from (default: their default branch)")
+    s.set_defaults(fn=cmd_start)
+    sub.add_parser("status").set_defaults(fn=cmd_status)
+    sub.add_parser("handoff").set_defaults(fn=cmd_handoff)
+    a = ap.parse_args()
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()

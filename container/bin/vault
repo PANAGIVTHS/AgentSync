@@ -1,0 +1,460 @@
+#!/usr/bin/env python3
+"""vault: keyword-indexed Obsidian memory for the agent (standard library only).
+
+Each note is a short Markdown file with YAML frontmatter. Its `tags` are the
+keywords used for lookup and show up as tags in Obsidian. Index.md is rebuilt on
+every change, so the vault doubles as a browsable map in Obsidian. Every write is
+committed to the vault's own git history, so any change can be seen or undone.
+
+  vault find <words…>           ranked matches: path, title, tags, first line
+  vault show <note>             print a note
+  vault add <title> --tags a,b [--project P] --stdin|--body TEXT
+  vault update <note> [--stdin|--body TEXT] [--append TEXT] [--tags …] [--add-tags …] [--verified SHA]
+  vault rm <note>
+  vault tags | lint | index
+  vault suggest --hook          UserPromptSubmit hook: lists strongly matching notes, else prints nothing
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import subprocess
+import sys
+from collections import Counter
+from pathlib import Path
+
+VAULT = Path(os.environ.get("AGENT_VAULT", "/vault"))
+SKIP_DIRS = {".git", ".obsidian", ".trash", "templates"}
+SKIP_FILES = {"Index.md", "README.md"}
+MAX_BODY_LINES = 60
+STALE_DAYS = 180
+SUGGEST_MIN_SCORE = 4
+STOP = set("""
+a about after again all also an and any are as at be because been before being both but by can
+could did do does doing done each few for from further get got had has have having he her here
+him his how i if in into is it its just let like make me more most much my need new no not now of
+off on once only or other our out over own please same she should so some such than that the
+their them then there these they this those through to too try under until up us use using very
+want was way we were what when where which while who why will with would yeah yes you your
+""".split())
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+# ---------------------------------------------------------------- parsing
+
+def parse(text: str) -> tuple[dict, str]:
+    """Minimal frontmatter reader for the flat format this tool writes."""
+    meta: dict = {}
+    if not text.startswith("---\n"):
+        return meta, text
+    end = text.find("\n---", 3)
+    if end == -1:
+        return meta, text
+    key = None
+    for line in text[4:end].splitlines():
+        m = re.match(r"^([A-Za-z_][\w-]*):\s*(.*)$", line)
+        if m:
+            key, val = m.group(1), m.group(2).strip()
+            if val.startswith("[") and val.endswith("]"):
+                meta[key] = [v.strip().strip("'\"") for v in val[1:-1].split(",") if v.strip()]
+            else:
+                meta[key] = [] if val == "" else val.strip("'\"")
+        elif key and re.match(r"^\s*-\s+", line):
+            if not isinstance(meta.get(key), list):
+                meta[key] = []
+            meta[key].append(re.sub(r"^\s*-\s+", "", line).strip().strip("'\""))
+    body = text[end + 4:]
+    return meta, body.lstrip("\n")
+
+
+def as_list(v) -> list[str]:
+    if isinstance(v, list):
+        return [str(x) for x in v if str(x).strip()]
+    return [s.strip() for s in str(v).split(",") if s.strip()] if v else []
+
+
+def norm_tag(t: str) -> str:
+    t = re.sub(r"\s+", "-", t.strip().lstrip("#").lower())
+    return re.sub(r"[^a-z0-9_/.+-]", "", t).strip("-")
+
+
+def norm_tags(v) -> list[str]:
+    seen = []
+    for t in map(norm_tag, as_list(v)):
+        if t and t not in seen:
+            seen.append(t)
+    return seen
+
+
+def terms(text: str) -> list[str]:
+    found = []
+    for w in re.findall(r"[a-z0-9][a-z0-9_.+/-]*[a-z0-9+]|[a-z0-9]", text.lower()):
+        for part in [w, *re.split(r"[-_/.]", w)]:
+            if len(part) >= 2 and part not in STOP and part not in found:
+                found.append(part)
+    return found
+
+
+def note_files() -> list[Path]:
+    if not VAULT.is_dir():
+        return []
+    files = []
+    for p in VAULT.rglob("*.md"):
+        rel = p.relative_to(VAULT)
+        if rel.parts and rel.parts[0] in SKIP_DIRS or any(part in SKIP_DIRS for part in rel.parts[:-1]):
+            continue
+        if len(rel.parts) == 1 and rel.name in SKIP_FILES:
+            continue
+        files.append(p)
+    return sorted(files)
+
+
+def load(path: Path) -> dict:
+    meta, body = parse(path.read_text(encoding="utf-8", errors="replace"))
+    rel = path.relative_to(VAULT).as_posix()
+    title = meta.get("title") if isinstance(meta.get("title"), str) and meta.get("title") else ""
+    if not title:
+        m = re.search(r"^#\s+(.+)$", body, re.M)
+        title = m.group(1).strip() if m else path.stem.replace("-", " ")
+    project = meta.get("project") if isinstance(meta.get("project"), str) else ""
+    if not project and rel.startswith("projects/") and rel.count("/") >= 2:
+        project = rel.split("/")[1]
+    return {"path": rel, "file": path, "title": title, "tags": norm_tags(meta.get("tags")),
+            "aliases": as_list(meta.get("aliases")), "project": project,
+            "updated": str(meta.get("updated") or ""), "verified": str(meta.get("verified") or ""),
+            "meta": meta, "body": body}
+
+
+def notes() -> list[dict]:
+    return [load(p) for p in note_files()]
+
+
+def first_line(body: str) -> str:
+    for line in body.splitlines():
+        s = line.strip()
+        if s and not s.startswith("#"):
+            return s[:110] + ("…" if len(s) > 110 else "")
+    return ""
+
+
+# ---------------------------------------------------------------- scoring
+
+def score(n: dict, ts: list[str], project: str, with_body: bool = True) -> int:
+    tags = set(n["tags"])
+    tag_parts = {p for t in tags for p in re.split(r"[-_/.]", t) if p}
+    title = set(terms(n["title"] + " " + " ".join(n["aliases"])))
+    body = set(terms(n["body"])) if with_body else set()
+    s = 0
+    for t in ts:
+        if t in tags:
+            s += 5
+        elif t in tag_parts or t in title:
+            s += 3
+        elif len(t) >= 4 and any(len(x) >= 4 and (x.startswith(t) or t.startswith(x)) for x in tags):
+            s += 2
+        elif t in body:
+            s += 1
+    if s and project and n["project"] == project:
+        s += 1
+    return s
+
+
+def ranked(ts: list[str], project: str, with_body: bool = True) -> list[tuple[int, dict]]:
+    hits = [(score(n, ts, project, with_body), n) for n in notes()]
+    hits = [h for h in hits if h[0] > 0]
+    hits.sort(key=lambda h: (h[0], h[1]["updated"]), reverse=True)
+    return hits
+
+
+def project_from(cwd: str) -> str:
+    parts = Path(cwd).parts
+    return parts[2] if len(parts) >= 3 and parts[1] == "work" else ""
+
+
+# ---------------------------------------------------------------- writing
+
+def slugify(title: str) -> str:
+    s = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+    return s[:60].rstrip("-") or "note"
+
+
+def today() -> str:
+    return dt.date.today().isoformat()
+
+
+def render(meta: dict, body: str) -> str:
+    order = ["title", "tags", "aliases", "project", "updated", "verified"]
+    lines = ["---"]
+    for key in order + [k for k in meta if k not in order]:
+        if key not in meta or meta[key] in ("", None, []):
+            continue
+        v = meta[key]
+        lines.append(f"{key}: [{', '.join(v)}]" if isinstance(v, list) else f"{key}: {v}")
+    lines.append("---")
+    return "\n".join(lines) + "\n\n" + body.strip("\n") + "\n"
+
+
+def commit(message: str) -> None:
+    if not (VAULT / ".git").is_dir():
+        return
+    base = ["git", "-C", str(VAULT), "-c", "core.hooksPath=/dev/null"]
+    subprocess.run(base + ["add", "-A"], capture_output=True)
+    subprocess.run(base + ["commit", "--quiet", "-m", message], capture_output=True)
+
+
+def reindex() -> None:
+    groups: dict[str, list[dict]] = {}
+    for n in notes():
+        groups.setdefault(n["project"] or "", []).append(n)
+    lines = ["# Vault index", "",
+             "Rebuilt by `vault` on every change; don't edit by hand. "
+             "Each note's tags are the keywords the agent searches.", ""]
+    for key in sorted(groups, key=lambda k: (k != "", k)):
+        lines.append("## General" if not key else f"## Project: {key}")
+        for n in sorted(groups[key], key=lambda n: n["title"].lower()):
+            tags = " ".join(f"#{t}" for t in n["tags"])
+            lines.append(f"- [[{n['path'][:-3]}|{n['title']}]] {tags}".rstrip())
+        lines.append("")
+    if not groups:
+        lines.append("_No notes yet._")
+    (VAULT / "Index.md").write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+
+def resolve(arg: str) -> Path:
+    for cand in (VAULT / arg, VAULT / f"{arg}.md"):
+        try:
+            cand.resolve().relative_to(VAULT.resolve())
+        except ValueError:
+            die("note path must be inside the vault")
+        if cand.is_file():
+            return cand
+    stem = Path(arg).stem
+    matches = [p for p in note_files() if p.stem == stem]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        die(f"no note {arg!r}. Try: vault find <keywords>")
+    die("ambiguous; use the full path: " + ", ".join(p.relative_to(VAULT).as_posix() for p in matches))
+
+
+def read_body(a) -> str | None:
+    if a.body is not None:
+        return a.body
+    if getattr(a, "stdin", False):
+        return sys.stdin.read()
+    return None
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_find(a) -> None:
+    ts = terms(" ".join(a.words))
+    if not ts:
+        die("give some keywords")
+    hits = ranked(ts, a.project or project_from(os.getcwd()))[: a.limit]
+    if not hits:
+        common = [t for t, _ in Counter(t for n in notes() for t in n["tags"]).most_common(15)]
+        print("No matching notes." + (f" Known tags: {', '.join(common)}" if common else " The vault is empty."))
+        return
+    for s, n in hits:
+        tags = ", ".join(n["tags"])
+        when = f" · {n['updated']}" if n["updated"] else ""
+        print(f"{n['path']} · {n['title']} [{tags}]{when}")
+        line = first_line(n["body"])
+        if line:
+            print(f"    {line}")
+
+
+def cmd_show(a) -> None:
+    text = resolve(a.note).read_text(encoding="utf-8", errors="replace").splitlines()
+    print("\n".join(text[: a.lines]))
+    if len(text) > a.lines:
+        print(f"… ({len(text) - a.lines} more lines; --lines N)")
+
+
+def cmd_add(a) -> None:
+    tags = norm_tags(a.tags)
+    if not tags:
+        die("give at least one keyword with --tags a,b")
+    body = read_body(a)
+    if not body or not body.strip():
+        die("empty note; pass --body TEXT or --stdin")
+    project = a.project or ""
+    if project and not re.fullmatch(r"[A-Za-z0-9_-]+", project):
+        die("invalid project name")
+    folder = VAULT / "projects" / project if project else VAULT / "topics"
+    path = folder / f"{slugify(a.title)}.md"
+    rel = path.relative_to(VAULT).as_posix()
+    if path.exists():
+        die(f"{rel} already exists; use: vault update {rel}")
+    similar = [n for n in notes()
+               if n["tags"] and len(set(n["tags"]) & set(tags)) / len(tags) >= 0.6
+               and (not project or n["project"] in ("", project))]
+    if similar and not a.force:
+        print("Similar notes exist. Update one of them instead, or re-run with --force:")
+        for n in similar[:5]:
+            print(f"  {n['path']} · {n['title']} [{', '.join(n['tags'])}]")
+        sys.exit(2)
+    lines = body.strip("\n").count("\n") + 1
+    meta = {"title": a.title, "tags": tags, "project": project, "updated": today(), "verified": a.verified or ""}
+    folder.mkdir(parents=True, exist_ok=True)
+    path.write_text(render(meta, body), encoding="utf-8")
+    reindex()
+    commit(f"vault: add {rel}")
+    print(f"saved {rel}" + (f" (long: {lines} lines; aim for under {MAX_BODY_LINES})" if lines > MAX_BODY_LINES else ""))
+
+
+def cmd_update(a) -> None:
+    path = resolve(a.note)
+    n = load(path)
+    meta, body = dict(n["meta"]), n["body"]
+    new_body = read_body(a)
+    if new_body is not None:
+        if not new_body.strip():
+            die("empty body; use vault rm to delete a note")
+        body = new_body
+    if a.append:
+        body = body.rstrip("\n") + "\n" + a.append.strip("\n") + "\n"
+    if a.tags is not None:
+        meta["tags"] = norm_tags(a.tags)
+    if a.add_tags:
+        meta["tags"] = norm_tags(as_list(meta.get("tags")) + as_list(a.add_tags))
+    if a.title:
+        meta["title"] = a.title
+    if a.verified:
+        meta["verified"] = a.verified
+    if not norm_tags(meta.get("tags")):
+        die("a note needs at least one tag")
+    meta["updated"] = today()
+    path.write_text(render(meta, body), encoding="utf-8")
+    reindex()
+    rel = path.relative_to(VAULT).as_posix()
+    commit(f"vault: update {rel}")
+    print(f"updated {rel}")
+
+
+def cmd_rm(a) -> None:
+    path = resolve(a.note)
+    rel = path.relative_to(VAULT).as_posix()
+    path.unlink()
+    reindex()
+    commit(f"vault: remove {rel}")
+    print(f"removed {rel}")
+
+
+def cmd_tags(_a) -> None:
+    counts = Counter(t for n in notes() for t in n["tags"])
+    print(", ".join(f"{t} ({c})" for t, c in counts.most_common()) or "no tags yet")
+
+
+def cmd_lint(_a) -> None:
+    all_notes = notes()
+    problems = []
+    cutoff = dt.date.today() - dt.timedelta(days=STALE_DAYS)
+    for n in all_notes:
+        if not n["tags"]:
+            problems.append(f"{n['path']}: no tags (unfindable)")
+        lines = n["body"].count("\n") + 1
+        if lines > MAX_BODY_LINES:
+            problems.append(f"{n['path']}: {lines} lines; split or trim")
+        try:
+            if n["updated"] and dt.date.fromisoformat(n["updated"]) < cutoff:
+                problems.append(f"{n['path']}: not updated since {n['updated']}; re-check or remove")
+        except ValueError:
+            problems.append(f"{n['path']}: bad updated date {n['updated']!r}")
+    for i, x in enumerate(all_notes):
+        for y in all_notes[i + 1:]:
+            if x["tags"] and y["tags"] and x["project"] == y["project"]:
+                if len(set(x["tags"]) & set(y["tags"])) / min(len(x["tags"]), len(y["tags"])) >= 0.8:
+                    problems.append(f"{x['path']} and {y['path']}: nearly the same tags; merge?")
+    print("\n".join(problems) or f"ok: {len(all_notes)} notes, no problems")
+
+
+def cmd_index(_a) -> None:
+    reindex()
+    commit("vault: rebuild index")
+    print("index rebuilt")
+
+
+def cmd_suggest(a) -> None:
+    # Runs on every prompt: must be silent unless it has something strong to say.
+    try:
+        if os.environ.get("VAULT_SUGGEST", "1") == "0" or not VAULT.is_dir():
+            return
+        data = json.load(sys.stdin) if a.hook else {"prompt": " ".join(a.words), "cwd": os.getcwd()}
+        prompt = str(data.get("prompt") or "")
+        ts = terms(prompt)
+        if not ts:
+            return
+        hits = [h for h in ranked(ts, project_from(str(data.get("cwd") or "")), with_body=False)
+                if h[0] >= SUGGEST_MIN_SCORE][:3]
+        if hits:
+            print("Vault notes matching this prompt (read with `vault show <path>` only if useful):")
+            for _, n in hits:
+                print(f"- {n['path']} · {n['title']}")
+    except Exception:
+        return
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(prog="vault", description="Keyword-indexed Obsidian memory.")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("find", help="find notes by keywords")
+    s.add_argument("words", nargs="+")
+    s.add_argument("--project", help="boost notes of this project (default: from the current folder)")
+    s.add_argument("--limit", type=int, default=5)
+    s.set_defaults(fn=cmd_find)
+
+    s = sub.add_parser("show", help="print a note")
+    s.add_argument("note")
+    s.add_argument("--lines", type=int, default=80)
+    s.set_defaults(fn=cmd_show)
+
+    s = sub.add_parser("add", help="save a new note")
+    s.add_argument("title")
+    s.add_argument("--tags", required=True, help="comma-separated keywords")
+    s.add_argument("--project", help="project name; omit for general knowledge")
+    s.add_argument("--body")
+    s.add_argument("--stdin", action="store_true", help="read the body from stdin")
+    s.add_argument("--verified", help="commit the facts were checked against")
+    s.add_argument("--force", action="store_true", help="save even if similar notes exist")
+    s.set_defaults(fn=cmd_add)
+
+    s = sub.add_parser("update", help="change a note")
+    s.add_argument("note")
+    s.add_argument("--body")
+    s.add_argument("--stdin", action="store_true")
+    s.add_argument("--append")
+    s.add_argument("--title")
+    s.add_argument("--tags", help="replace tags")
+    s.add_argument("--add-tags")
+    s.add_argument("--verified")
+    s.set_defaults(fn=cmd_update)
+
+    s = sub.add_parser("rm", help="delete a note")
+    s.add_argument("note")
+    s.set_defaults(fn=cmd_rm)
+
+    sub.add_parser("tags", help="list tags by use").set_defaults(fn=cmd_tags)
+    sub.add_parser("lint", help="find unfindable, stale, long or duplicate notes").set_defaults(fn=cmd_lint)
+    sub.add_parser("index", help="rebuild Index.md").set_defaults(fn=cmd_index)
+
+    s = sub.add_parser("suggest", help="list notes strongly matching a prompt")
+    s.add_argument("words", nargs="*")
+    s.add_argument("--hook", action="store_true", help="read the Claude Code hook JSON from stdin")
+    s.set_defaults(fn=cmd_suggest)
+
+    a = ap.parse_args()
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,3 @@
+# Extra Debian packages for the agent container, one per line.
+# Add simple tools here (e.g. build-essential, verilator, iverilog), then: agent setup
+build-essential

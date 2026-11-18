@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+"""PreToolUse hook for Bash: block `git push` in any form.
+
+Defense in depth only: the mirror is mounted read-only and the container has no
+credentials, so a push could not succeed anyway. Blocking it early saves a turn.
+Prints nothing and exits 0 for every other command (costs no tokens).
+"""
+import json
+import os
+import re
+import shlex
+import sys
+
+GIT_OPTS_WITH_VALUE = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--config-env"}
+WRAPPERS = {"sudo", "command", "env", "exec", "nohup", "time", "xargs", "nice", "timeout"}
+SHELLS = {"sh", "bash", "dash", "zsh"}
+SPLIT = re.compile(r"&&|\|\||[;|&\n()`]|\$\(")
+
+
+def segment_pushes(tokens: list[str]) -> bool:
+    i, after_wrapper = 0, False
+    while i < len(tokens):
+        t = tokens[i]
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", t) or os.path.basename(t) in WRAPPERS:
+            after_wrapper = os.path.basename(t) in WRAPPERS or after_wrapper
+        elif not (after_wrapper and (t.startswith("-") or re.fullmatch(r"[\d.]+[smhd]?", t))):
+            break  # wrapper options and durations (timeout 5, nice -n 5) are skipped
+        i += 1
+    if i >= len(tokens):
+        return False
+    prog = os.path.basename(tokens[i])
+    if prog in SHELLS and "-c" in tokens[i + 1:]:
+        j = tokens.index("-c", i + 1)
+        return j + 1 < len(tokens) and pushes(tokens[j + 1])
+    if prog != "git":
+        return False
+    i += 1
+    while i < len(tokens) and tokens[i].startswith("-"):
+        opt = tokens[i].split("=", 1)[0]
+        i += 2 if opt in GIT_OPTS_WITH_VALUE and "=" not in tokens[i] else 1
+    return i < len(tokens) and tokens[i] == "push"
+
+
+def pushes(command: str) -> bool:
+    for part in SPLIT.split(command):
+        try:
+            tokens = shlex.split(part, comments=True)
+        except ValueError:
+            tokens = part.split()
+        if tokens and segment_pushes(tokens):
+            return True
+    return False
+
+
+def main() -> int:
+    try:
+        data = json.load(sys.stdin)
+    except ValueError:
+        return 0
+    command = (data.get("tool_input") or {}).get("command") or ""
+    if pushes(command):
+        print("Blocked: this agent never pushes. Commit on your agent/<task> branch; "
+              "the user pulls, reviews and pushes from their own account.", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

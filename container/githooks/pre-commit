@@ -1,0 +1,12 @@
+#!/bin/sh
+# The agent commits only on agent/<task> branches.
+gitdir=$(git rev-parse --git-dir)
+if [ -d "$gitdir/rebase-merge" ] || [ -d "$gitdir/rebase-apply" ]; then
+  exit 0
+fi
+branch=$(git branch --show-current)
+case "$branch" in
+  agent/*) exit 0 ;;
+esac
+echo "pre-commit: commit only on agent/<task> branches (current: ${branch:-detached HEAD}). Start one with /task." >&2
+exit 1

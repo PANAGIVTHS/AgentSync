@@ -1,0 +1,19 @@
+# Managed by `agent setup` (included from ~/.gitconfig in the container).
+[user]
+	name = Claude Agent
+	email = agent@localhost
+[core]
+	# Rejects commits outside agent/* branches.
+	hooksPath = /opt/agent/githooks
+[init]
+	defaultBranch = main
+[safe]
+	directory = *
+# Pushing is disabled for every kind of remote URL.
+[url "no-push://disabled/"]
+	pushInsteadOf = /
+	pushInsteadOf = file://
+	pushInsteadOf = https://
+	pushInsteadOf = http://
+	pushInsteadOf = ssh://
+	pushInsteadOf = git@
