@@ -5,7 +5,8 @@ The agent never writes to your repo. You share commits through a read-only
 mirror, the agent works on agent/<task> branches in its own clone, and this CLI
 fetches those branches back into your repo for review and merge.
 
-Standard library only, so it runs on any machine with Python 3.9+.
+Runs on any Python 3.9+. Output uses Rich (and rich-argparse for --help) when
+install.sh has set them up; otherwise it falls back to plain text.
 """
 from __future__ import annotations
 
@@ -37,16 +38,82 @@ class Fail(Exception):
     """A user-facing error, printed without a traceback."""
 
 
+# ---------------------------------------------------------------- output
+# Rich when available (installed by install.sh into the CLI's venv); plain text
+# otherwise or with AGENT_PLAIN=1. Messages are passed as Text, never as markup,
+# so brackets in branch names or agent-written text print literally.
+
+try:
+    if os.environ.get("AGENT_PLAIN") == "1":
+        raise ImportError
+    from rich import box
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+    OUT = Console(highlight=False, soft_wrap=True)
+    ERR = Console(stderr=True, highlight=False, soft_wrap=True)
+except ImportError:
+    OUT = ERR = None
+
+try:
+    if OUT is None:
+        raise ImportError
+    from rich_argparse import RichHelpFormatter as HELP_FORMAT
+except ImportError:
+    HELP_FORMAT = argparse.HelpFormatter
+
+
+def _say(console, plain_prefix: str, rich_prefix: tuple[str, str], msg: str, style: str = "", err=False) -> None:
+    if console is None:
+        print(f"{plain_prefix}{msg}", file=sys.stderr if err else sys.stdout)
+    else:
+        console.print(Text.assemble(rich_prefix, (msg, style)))
+
+
 def ok(msg: str) -> None:
-    print(f"✓ {msg}")
+    _say(OUT, "✓ ", ("✓ ", "bold green"), msg)
 
 
 def note(msg: str) -> None:
-    print(f"  {msg}")
+    _say(OUT, "  ", ("  ", ""), msg, "dim")
 
 
 def warn(msg: str) -> None:
-    print(f"! {msg}", file=sys.stderr)
+    _say(ERR, "! ", ("! ", "bold yellow"), msg, err=True)
+
+
+def error(msg: str) -> None:
+    _say(ERR, "✗ ", ("✗ ", "bold red"), msg, err=True)
+
+
+def heading(msg: str) -> None:
+    if OUT is None:
+        print(msg)
+    else:
+        OUT.print(Text(msg, style="bold cyan"))
+
+
+def table(columns: list[str], rows: list[list[str]], styles: list[str] | None = None) -> None:
+    """A borderless table; plain mode aligns columns with spaces."""
+    if OUT is None:
+        widths = [max(len(str(r[i])) for r in [columns, *rows]) for i in range(len(columns))]
+        for r in [columns, *rows]:
+            print("  " + "  ".join(str(c).ljust(w) for c, w in zip(r, widths)).rstrip())
+        return
+    t = Table(box=box.SIMPLE_HEAD, show_edge=False, header_style="bold", pad_edge=False)
+    for i, c in enumerate(columns):
+        t.add_column(c, style=(styles or [""] * len(columns))[i], overflow="fold")
+    for r in rows:
+        t.add_row(*[Text(str(c)) for c in r])
+    OUT.print(t)
+
+
+def panel(text: str, title: str) -> None:
+    if OUT is None:
+        print(f"── {title} ──\n{text}\n")
+    else:
+        OUT.print(Panel(Text(text), title=title, title_align="left", border_style="dim", expand=False))
 
 
 def sanitize(text: str) -> str:
@@ -240,11 +307,11 @@ def cmd_share(a) -> None:
         raise Fail("this repo already has a remote named 'agent'. Remove or rename it first")
     hooks_ok = not a.no_hooks and hooks_dir(src) is not None
 
-    print(f"Share {name}")
+    heading(f"Share {name}")
     note(f"Your repo:    {src}")
     note(f"Branches:     {len(branches)} (default {default}); committed history only")
     note(f"Agent clone:  /work/{name} in the container")
-    print("Changes to your repo:")
+    heading("Changes to your repo")
     note("+ remote 'agent' (fetch only; pushing to it is disabled)")
     if hooks_ok:
         note("+ hooks post-commit, post-merge, post-rewrite: auto-send your commits")
@@ -324,60 +391,108 @@ def cmd_pull(a) -> None:
     if not tasks:
         ok("no agent branches yet")
         return
-    print(f"Agent branches in {name}:")
+    rows = []
     for task in tasks:
         ref = f"refs/remotes/agent/{task}"
         new = out(src, "rev-list", "--count", f"HEAD..{ref}")
         subject = sanitize(out(src, "log", "-1", "--format=%s", ref))[:60]
-        ready = "handoff" if handoff_of(name, task).exists() else "-"
+        ready = "written" if handoff_of(name, task).exists() else "-"
         state = "merged" if new == "0" else f"{new} new"
-        print(f"  agent/{task:<24} {state:>8}  {ready:<8} {subject}")
-    note("Review: agent review <task>    Merge: agent merge <task>")
+        rows.append([f"agent/{task}", state, ready, subject])
+    heading(f"Agent branches in {name}")
+    table(["Branch", "Commits", "Handoff", "Last commit"], rows, ["bold green", "", "", "dim"])
+    note("Review: agent review <task>    Merge: agent merge <task> [--edit]")
 
 
-def close_review(src: Path, name: str, task: str) -> bool:
+# ---------------------------------------------------------------- review copies
+# A review copy is a detached worktree of YOUR repo: HEAD = the base, files = the
+# agent's version, so VS Code shows the whole task as staged changes. If you edit
+# it, those edits are saved as a patch before the copy is replaced or removed and
+# carried into the next review copy or into the merge. Nothing you type is lost.
+
+def reviewed_file(name: str, task: str) -> Path:
+    return AGENT_HOME / "review" / name / f".{task}.reviewed"
+
+
+def save_review_edits(name: str, task: str) -> Path | None:
+    wt, meta = review_of(name, task), reviewed_file(name, task)
+    if not wt.is_dir() or not meta.exists():
+        return None
+    reviewed = meta.read_text().strip()
+    git(wt, "add", "-A")  # this worktree's own index only
+    if git(wt, "diff", "--cached", "--quiet", reviewed, check=False).returncode == 0:
+        return None
+    patch = git(wt, "diff", "--cached", "--binary", reviewed).stdout
+    f = AGENT_HOME / "review" / name / f"{task}-your-edits-{time.strftime('%Y%m%d-%H%M%S')}.patch"
+    f.write_text(patch)
+    return f
+
+
+def close_review(src: Path, name: str, task: str) -> tuple[bool, Path | None]:
+    """Remove the review copy. Returns (existed, patch of your edits or None)."""
     wt = review_of(name, task)
     if not wt.exists():
-        return False
+        return False, None
+    patch = save_review_edits(name, task)
     git(src, "worktree", "remove", "--force", wt, check=False)
     shutil.rmtree(wt, ignore_errors=True)
+    reviewed_file(name, task).unlink(missing_ok=True)
     git(src, "worktree", "prune")
-    return True
+    return True, patch
+
+
+def apply_patch(repo: Path, patch: Path, three_way: bool) -> bool:
+    args = ["apply", "--whitespace=nowarn"] + (["--3way"] if three_way else []) + [str(patch)]
+    return git(repo, *args, check=False).returncode == 0
 
 
 def cmd_review(a) -> None:
     name, src = resolve_project(a.project)
     task = normalize_task(a.task)
     if a.close:
-        ok("review closed" if close_review(src, name, task) else "no open review")
+        existed, patch = close_review(src, name, task)
+        if patch:
+            warn(f"you had edits in the review copy; saved them to {patch}")
+            note(f"Apply them in your repo any time: git apply --3way {patch}")
+        ok("review closed" if existed else "no open review")
         return
     fetch_agent(src)
     ref = require_task(src, task)
     base = out(src, "merge-base", a.base, ref)
-    print(f"Review agent/{task}  (against {a.base} @ {base[:9]})\n")
+    heading(f"Review agent/{task}  (against {a.base} @ {base[:9]})")
     hand = handoff_of(name, task)
     if hand.exists():
-        print(sanitize(hand.read_text(errors="replace")).strip() + "\n")
+        panel(sanitize(hand.read_text(errors="replace")).strip(), "Handoff")
     else:
-        note("(no handoff written yet)\n")
-    log = out(src, "log", "--oneline", "--no-decorate", f"{base}..{ref}")
-    print(sanitize(log) or "  (no commits)")
+        note("(no handoff written yet)")
+    log = sanitize(out(src, "log", "--oneline", "--no-decorate", f"{base}..{ref}"))
+    rows = [line.split(" ", 1) + [""] * (1 - line.count(" ")) for line in log.splitlines()]
+    if rows:
+        table(["Commit", "Message"], rows, ["yellow", ""])
+    else:
+        note("(no commits)")
     stat = out(src, "diff", "--stat", base, ref).splitlines()
     if stat:
-        print("  " + stat[-1].strip())
-    close_review(src, name, task)
+        note(stat[-1].strip())
+    _, patch = close_review(src, name, task)
     wt = review_of(name, task)
     wt.parent.mkdir(parents=True, exist_ok=True)
     git(src, "worktree", "add", "--quiet", "--detach", wt, ref)
-    # HEAD = base, files = agent's version: Source Control shows the whole task as staged changes.
     git(wt, "reset", "--quiet", "--soft", base)
-    print()
+    reviewed_file(name, task).write_text(out(src, "rev-parse", ref) + "\n")
     ok(f"review copy: {wt}")
+    if patch:
+        if apply_patch(wt, patch, three_way=False):
+            ok("carried your edits from the previous review copy into this one (unstaged)")
+            patch.unlink()
+        else:
+            warn(f"couldn't carry your previous edits over cleanly; they're saved in {patch}")
     if not a.no_open and shutil.which("code"):
         subprocess.Popen(["code", "--new-window", str(wt)], stdin=subprocess.DEVNULL,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
         note("opened in VS Code: Source Control lists every change the agent made")
-    note(f"Merge: agent merge {task}    Close: agent review {task} --close")
+    note("Small fixes: edit here or after `agent merge --edit`; your edits go into the merge either way.")
+    note(f"Merge: agent merge {task} [--edit]    Close: agent review {task} --close")
 
 
 def cmd_merge(a) -> None:
@@ -387,20 +502,41 @@ def cmd_merge(a) -> None:
         raise Fail("your repo has uncommitted changes. Commit or stash them first")
     fetch_agent(src)
     ref = require_task(src, task)
-    close_review(src, name, task)
+    if git(src, "merge-base", "--is-ancestor", ref, "HEAD", check=False).returncode == 0:
+        ok(f"agent/{task} is already merged into your branch; nothing to do")
+        return
+    _, patch = close_review(src, name, task)
     if a.squash:
         args = ["merge", "--squash", ref]
+    elif a.edit:
+        args = ["merge", "--no-ff", "--no-commit", "-m", f"Merge agent/{task}", ref]
     else:
         args = ["merge", "--no-ff", "-m", f"Merge agent/{task}", ref]
     p = git(src, *args, check=False, capture=False)
     if p.returncode:
         warn("merge stopped on conflicts. In VS Code: Source Control → Merge Changes → resolve, then `git commit`.")
         note("To undo: git merge --abort")
+        if patch:
+            note(f"Your review-copy edits are saved; after resolving, apply them: git apply --3way {patch}")
         sys.exit(1)
-    if a.squash:
-        ok("changes staged. Review them and `git commit`, then `git push` when ready")
+    applied = False
+    if patch:
+        if apply_patch(src, patch, three_way=True):
+            ok("applied the edits you made in the review copy")
+            patch.unlink()
+            applied = True
+        else:
+            warn(f"couldn't apply your review-copy edits cleanly; they're saved in {patch}")
+    if a.edit:
+        ok(f"merge of agent/{task} started, not committed: the agent's changes are staged in your repo")
+        note("Make your fixes in VS Code (rename, tweak), stage them, then `git commit`.")
+        note("To undo everything: git merge --abort")
+    elif a.squash:
+        ok("changes staged as one change. Review them and `git commit`, then `git push` when ready")
     else:
         ok(f"merged agent/{task}. Push when ready: git push")
+        if applied:
+            note("Your review-copy edits are staged on top of the merge: check them and `git commit`.")
 
 
 def cmd_list(_a) -> None:
@@ -408,6 +544,7 @@ def cmd_list(_a) -> None:
     if not reg:
         print("No shared repos. Share one: agent share PATH --yes")
         return
+    rows = []
     for name, info in sorted(reg.items()):
         src = Path(info["source"])
         flags = []
@@ -417,7 +554,9 @@ def cmd_list(_a) -> None:
             flags.append("agent clone missing")
         if not info.get("hooks"):
             flags.append("manual push")
-        print(f"  {name:<20} {src}  {', '.join(flags) or 'ok'}")
+        rows.append([name, str(src), ", ".join(flags) or "ok"])
+    heading(f"Shared repos · {len(rows)}")
+    table(["Project", "Your repo", "Status"], rows, ["bold green", "cyan", ""])
 
 
 def cmd_unshare(a) -> None:
@@ -436,7 +575,11 @@ def cmd_unshare(a) -> None:
             return
     if src.is_dir():
         for task in agent_tasks(src):
-            close_review(src, name, task)
+            _, patch = close_review(src, name, task)
+            if patch:
+                kept = Path.home() / patch.name
+                shutil.move(str(patch), kept)
+                warn(f"you had edits in the {task} review copy; saved them to {kept}")
         remove_hooks(src)
         git(src, "remote", "remove", "agent", check=False)
     for p in (mirror_of(name), work_of(name), AGENT_HOME / "handoffs" / name, AGENT_HOME / "review" / name):
@@ -572,8 +715,15 @@ def cmd_doctor(_a) -> None:
 
     def check(label: str, good: bool, hint: str = "") -> None:
         nonlocal bad
-        print(f"  {'✓' if good else '✗'} {label}" + ("" if good or not hint else f"  → {hint}"))
+        tail = "" if good or not hint else f"  → {hint}"
+        if OUT is None:
+            print(f"  {'✓' if good else '✗'} {label}{tail}")
+        else:
+            OUT.print(Text.assemble(("  ✓ " if good else "  ✗ ", "bold green" if good else "bold red"),
+                                    label, (tail, "yellow")))
         bad += not good
+
+    heading("agent doctor")
 
     docker = shutil.which("docker") is not None
     check("git installed", shutil.which("git") is not None)
@@ -588,8 +738,12 @@ def cmd_doctor(_a) -> None:
         check("logged in to Claude", bool(re.search(r'"loggedIn":\s*true', status)), "agent login")
     check("vault exists", (dirs()["vault"] / ".git").is_dir(), "agent setup")
     launcher = shutil.which("agent")
-    check("`agent` on PATH", launcher is not None and Path(launcher).resolve() == Path(__file__).resolve(),
-          "run ./install.sh, or add ~/.local/bin to PATH")
+    me = str(Path(__file__).resolve())
+    mine = launcher is not None and (Path(launcher).resolve() == Path(me)
+                                     or me in Path(launcher).read_text(errors="replace"))
+    check("`agent` on PATH", mine, "run ./install.sh, or add ~/.local/bin to PATH")
+    check("pretty output (Rich)", OUT is not None or os.environ.get("AGENT_PLAIN") == "1",
+          "re-run ./install.sh (Ubuntu may need: sudo apt install python3-venv)")
     for name, info in sorted(load_registry().items()):
         src = Path(info["source"])
         url = git(src, "remote", "get-url", "agent", check=False).stdout.strip() if src.is_dir() else ""
@@ -602,8 +756,11 @@ def cmd_doctor(_a) -> None:
 # ---------------------------------------------------------------- main
 
 def main(argv=None) -> None:
-    ap = argparse.ArgumentParser(prog="agent", description="Host CLI for the Claude Code agent container.")
+    ap = argparse.ArgumentParser(prog="agent", description="Host CLI for the Claude Code agent container.",
+                                 formatter_class=HELP_FORMAT)
     sub = ap.add_subparsers(dest="cmd", required=True, metavar="COMMAND")
+    add_parser = sub.add_parser
+    sub.add_parser = lambda *args, **kw: add_parser(*args, formatter_class=HELP_FORMAT, **kw)
 
     s = sub.add_parser("setup", help="set up this machine: folders, Claude config, vault, image, container")
     s.add_argument("--claude-version", help="Claude Code version for the image (default: pinned, else latest)")
@@ -646,7 +803,10 @@ def main(argv=None) -> None:
 
     s = sub.add_parser("merge", help="merge a task into your current branch")
     s.add_argument("task")
-    s.add_argument("--squash", action="store_true", help="stage the task as one change instead of merging")
+    mode = s.add_mutually_exclusive_group()
+    mode.add_argument("--edit", action="store_true",
+                      help="start the merge without committing, so you can make small fixes first")
+    mode.add_argument("--squash", action="store_true", help="stage the task as one change instead of merging")
     s.set_defaults(fn=cmd_merge)
 
     s = sub.add_parser("unshare", help="stop sharing a repo and delete the agent's copy")
@@ -664,7 +824,7 @@ if __name__ == "__main__":
     try:
         main()
     except Fail as e:
-        print(f"✗ {e}", file=sys.stderr)
+        error(str(e))
         sys.exit(1)
     except KeyboardInterrupt:
         sys.exit(130)

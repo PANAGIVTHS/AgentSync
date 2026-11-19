@@ -82,7 +82,7 @@ class CliTest(unittest.TestCase):
         out = self.agent("pull").stdout
         self.assertIn("agent/uart-fix", out)
         self.assertIn("1 new", out)
-        self.assertIn("handoff", out)
+        self.assertIn("written", out)
 
         out = self.agent("review", "uart-fix", "--no-open").stdout
         self.assertIn("Fixed it.", out)
@@ -117,6 +117,68 @@ class CliTest(unittest.TestCase):
     def test_review_unknown_task(self):
         self.share()
         self.assertIn("no agent branch", self.agent("review", "nope", "--no-open", check=False).stderr)
+
+    def test_merge_edit_lets_you_fix_before_committing(self):
+        self.share()
+        self.agent_commit("agent/rename", "src/a.txt", "agent_name = 1\n")
+        out = self.agent("merge", "rename", "--edit").stdout
+        self.assertIn("started, not committed", out)
+        self.assertEqual(self.s.git(self.user, "rev-parse", "-q", "--verify", "MERGE_HEAD", check=False).returncode, 0)
+        # Your small fix, then your commit.
+        (self.user / "src" / "a.txt").write_text("better_name = 1\n")
+        self.s.git(self.user, "commit", "-q", "-am", "Merge agent/rename with a rename")
+        parents = self.s.git(self.user, "log", "-1", "--format=%P").stdout.split()
+        self.assertEqual(len(parents), 2)
+        self.assertEqual(self.s.git(self.user, "show", "HEAD:src/a.txt").stdout, "better_name = 1\n")
+        self.assertIn("merged", self.agent("pull").stdout)
+
+    def test_edits_in_review_copy_are_carried_into_merge(self):
+        self.share()
+        self.agent_commit("agent/x", "src/a.txt", "agent\n")
+        self.agent("review", "x", "--no-open")
+        wt = self.agent_home / "review" / "myrepo" / "x"
+        (wt / "src" / "a.txt").write_text("agent, renamed by me\n")
+        (wt / "NEW.md").write_text("my note\n")
+        out = self.agent("merge", "x", "--edit").stdout
+        self.assertIn("applied the edits you made in the review copy", out)
+        self.assertEqual((self.user / "src" / "a.txt").read_text(), "agent, renamed by me\n")
+        self.assertEqual((self.user / "NEW.md").read_text(), "my note\n")
+        self.assertFalse(wt.exists())
+
+    def test_rerunning_review_keeps_your_edits(self):
+        self.share()
+        self.agent_commit("agent/x", "src/a.txt", "agent\n")
+        self.agent("review", "x", "--no-open")
+        wt = self.agent_home / "review" / "myrepo" / "x"
+        (wt / "src" / "a.txt").write_text("mine\n")
+        out = self.agent("review", "x", "--no-open").stdout
+        self.assertIn("carried your edits", out)
+        self.assertEqual((wt / "src" / "a.txt").read_text(), "mine\n")
+
+    def test_closing_review_saves_your_edits_as_a_patch(self):
+        self.share()
+        self.agent_commit("agent/x", "src/a.txt", "agent\n")
+        self.agent("review", "x", "--no-open")
+        wt = self.agent_home / "review" / "myrepo" / "x"
+        (wt / "src" / "a.txt").write_text("mine\n")
+        p = self.agent("review", "x", "--close")
+        self.assertIn("saved them to", p.stderr)
+        patches = list((self.agent_home / "review" / "myrepo").glob("x-your-edits-*.patch"))
+        self.assertEqual(len(patches), 1)
+        self.assertIn("+mine", patches[0].read_text())
+        # An untouched review copy closes without a patch.
+        self.agent("review", "x", "--no-open")
+        self.assertNotIn("saved", self.agent("review", "x", "--close").stderr)
+
+    def test_merge_of_already_merged_task(self):
+        self.share()
+        self.agent_commit("agent/x", "src/a.txt", "agent\n")
+        self.agent("merge", "x")
+        self.assertIn("already merged", self.agent("merge", "x").stdout)
+
+    def test_edit_and_squash_are_exclusive(self):
+        self.share()
+        self.assertNotEqual(self.agent("merge", "x", "--edit", "--squash", check=False).returncode, 0)
 
     def test_unshare_cleans_up(self):
         self.share()

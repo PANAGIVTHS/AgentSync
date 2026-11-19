@@ -22,7 +22,8 @@ class Sandbox:
 
     def env(self, **extra):
         env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
-        env.update(HOME=str(self.home), AGENT_HOME=str(self.root / "Agent"), **extra)
+        env.update(HOME=str(self.home), AGENT_HOME=str(self.root / "Agent"), AGENT_PLAIN="1")
+        env.update(extra)
         return env
 
     def run(self, *cmd, cwd=None, check=True, input=None, **env):

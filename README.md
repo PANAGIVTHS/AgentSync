@@ -21,7 +21,7 @@ cd ~/agent-setup
 agent login
 ```
 
-`install.sh` puts `agent` on your PATH (`~/.local/bin`), then `agent setup`:
+`install.sh` creates a small Python environment for the CLI (`~/.local/share/agent/venv`, with Rich for tables and coloured output). If that isn't possible, for example on Ubuntu without `python3-venv`, the CLI still works with plain output. It then puts `agent` on your PATH (`~/.local/bin`) and runs `agent setup`, which:
 - creates `~/Agent/`;
 - installs the agent's Claude config;
 - creates the Obsidian vault;
@@ -60,11 +60,26 @@ In the browser, open the repo and start a session:
 In your terminal, from inside your repo:
 
 ```bash
-agent pull                 # fetch the agent's branches (as agent/<task>)
+agent pull                 # fetch the agent's branches (as agent/<task>); your files are untouched
 agent review uart-fix      # summary + commits, then VS Code with every change shown as staged
 agent merge uart-fix       # real git merge; conflicts open in VS Code's merge editor
 git push                   # you push, from your account
 ```
+
+**Small fixes yourself.** A rename or a tweak doesn't need another round with the agent. Use:
+
+```bash
+agent merge uart-fix --edit
+```
+
+This starts the merge without committing. The agent's changes are staged in your repo; make your fixes in VS Code, then `git commit`. `git merge --abort` undoes it all.
+
+You can also edit the review copy that `agent review` opens. Your edits are never thrown away:
+- `agent merge` (with or without `--edit`) applies them in your repo.
+- Running `agent review` again carries them into the fresh copy.
+- `agent review <task> --close` saves them as a patch and tells you where.
+
+`--squash` stages the whole task as one change instead of a merge.
 
 `agent push --wip` sends your uncommitted tracked changes too; the agent sees them as `desktop-wip/<branch>`. Other commands:
 - `agent list` and `agent doctor` show what's shared and whether everything is healthy.
@@ -116,7 +131,8 @@ Add Debian packages to `container/packages.txt`, then run `./install.sh`. Tools 
 ## Layout
 
 ```text
-cli/agent.py              host CLI (stdlib only)
+cli/agent.py              host CLI (Rich output when available, plain otherwise)
+requirements.txt          Rich + rich-argparse for the CLI's venv
 container/                Dockerfile, compose, packages.txt, gitconfig
 container/bin/            in-container tools: agent-task, vault, agent-guard, agent-supervisor
 container/githooks/       pre-commit: commits only on agent/* branches
@@ -132,4 +148,4 @@ tests/                    python3 -m unittest discover -s tests
 python3 -m unittest discover -s tests
 ```
 
-They use throwaway repos and a temporary `AGENT_HOME`, and never touch `~/Agent` or your projects. Docker and Remote Control aren't exercised by the tests; `agent doctor` checks them on a real machine.
+They use throwaway repos and a temporary `AGENT_HOME`, and never touch `~/Agent` or your projects. The Rich output tests run only when Rich is installed for that Python, e.g. with `~/.local/share/agent/venv/bin/python -m unittest discover -s tests`. Docker and Remote Control aren't exercised by the tests; `agent doctor` checks them on a real machine.
