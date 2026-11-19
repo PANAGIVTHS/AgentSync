@@ -19,7 +19,7 @@ class RichOutputTest(unittest.TestCase):
         self.s.cleanup()
 
     def agent(self, *args, check=True):
-        return self.s.run(sys.executable, CLI, *args, cwd=self.user, check=check, AGENT_PLAIN="0", NO_COLOR="1")
+        return self.s.run(sys.executable, CLI, *args, cwd=self.user, check=check, AGENT_PLAIN="0", NO_COLOR="1", COLUMNS="160")
 
     def test_tables_and_panels(self):
         self.agent("share", "--yes")

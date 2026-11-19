@@ -96,9 +96,11 @@ Options:
 
 ## Tab completion
 
-`agent completion install` sets it up for your shell (`install.sh` does this for you). Then open a new terminal. Tab completes commands, options, your shared repos, and the agent's task names with their last commit:
-- **zsh and fish** show a description next to each match, grouped and coloured.
-- **bash** completes the same names and highlights the part you've typed. Set `AGENT_COMPLETION_COLORS=0` to leave your readline colours alone.
+`agent completion install` sets it up for your shell (`install.sh` does this for you). It adds one line to `~/.bashrc` or `~/.zshrc`; fish needs none. Then open a new terminal. Tab completes commands, options, your shared repos, and the agent's task names:
+- Task names come straight from the agent's clone, so they complete before `agent pull`.
+- They complete from any folder: your repo, the review copy, or anywhere if you share only one repo. Otherwise add `--project NAME`.
+- When several things match, each is listed with a description: the task's last commit, or what a command does.
+- zsh and fish also colour and group the list. In bash, the part you've typed is highlighted. Set `AGENT_COMPLETION_COLORS=0` to leave your readline colours alone.
 
 `agent completion bash|zsh|fish` prints the script instead, if you'd rather install it yourself.
 
@@ -163,7 +165,7 @@ Add Debian packages to `container/packages.txt`, then run `./install.sh`. Tools 
 ## Layout
 
 ```text
-cli/agent.py              host CLI (Rich output when available, plain otherwise)
+cli/agent.py              host CLI (Claude-themed Rich output when available, plain otherwise)
 requirements.txt          Rich + rich-argparse for the CLI's venv
 container/                Dockerfile, compose, packages.txt, gitconfig
 container/bin/            in-container tools: agent-task, vault, agent-guard, agent-supervisor

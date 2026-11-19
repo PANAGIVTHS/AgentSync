@@ -99,7 +99,7 @@ class CompletionTest(unittest.TestCase):
         self.s.git(work, "switch", "-q", "-c", "agent/uart-fix")
         (work / "a.txt").write_text("two\n")
         self.s.git(work, "commit", "-q", "-am", "fix the uart")
-        self.s.run("python3", CLI, "pull", cwd=self.user)
+        self.work = work  # no `agent pull`: tasks must complete straight from the agent's clone
 
     def tearDown(self):
         self.s.cleanup()
@@ -121,6 +121,13 @@ class CompletionTest(unittest.TestCase):
         # zsh gets everything and does its own matching.
         self.assertIn("pull", [c[0] for c in self.complete("re", shell="zsh")])
 
+    def test_tasks_complete_from_anywhere(self):
+        # Outside any repo, with one shared repo, its tasks still complete.
+        out = self.s.run("python3", CLI, "__complete", "bash", "review", "", cwd=self.s.root).stdout
+        self.assertIn("uart-fix\tfix the uart\ttask", out)
+        out = self.s.run("python3", CLI, "__complete", "bash", "merge", "", cwd=self.work).stdout
+        self.assertIn("uart-fix", out)
+
     def test_bash_script(self):
         bindir = self.s.root / "bin"
         bindir.mkdir()
@@ -129,8 +136,21 @@ class CompletionTest(unittest.TestCase):
         script = self.s.run("python3", CLI, "completion", "bash").stdout
         probe = script + '\nCOMP_WORDS=(agent merge u); COMP_CWORD=2; _agent; printf "%s\\n" "${COMPREPLY[@]}"\n'
         import os
-        out = self.s.run("bash", "-c", probe, cwd=self.user, PATH=f"{bindir}:{os.environ['PATH']}").stdout
+        path = f"{bindir}:{os.environ['PATH']}"
+        out = self.s.run("bash", "-c", probe, cwd=self.user, PATH=path).stdout
         self.assertEqual(out.split(), ["uart-fix"])
+        # Several matches: each listed with its description.
+        probe = script + '\nCOMP_WORDS=(agent re); COMP_CWORD=1; _agent; printf "%s|\\n" "${COMPREPLY[@]}"\n'
+        lines = self.s.run("bash", "-c", probe, cwd=self.user, PATH=path, COLUMNS="60").stdout.splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(lines[0].startswith("restart  -- restart the container"))
+        self.assertTrue(all(len(line) == 60 for line in lines))
+
+    def test_install_bash(self):
+        self.s.run("python3", CLI, "completion", "install", "--shell", "bash", cwd=self.user, XDG_DATA_HOME="")
+        target = self.s.home / ".local" / "share" / "agent" / "completion.bash"
+        self.assertIn("complete -F _agent agent", target.read_text())
+        self.assertIn(str(target), (self.s.home / ".bashrc").read_text())
 
     def test_install(self):
         self.s.run("python3", CLI, "completion", "install", "--shell", "zsh", cwd=self.user,

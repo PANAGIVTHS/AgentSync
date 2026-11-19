@@ -72,20 +72,28 @@ class Fail(Exception):
 # Rich when available (installed by install.sh into the CLI's venv); plain text
 # otherwise or with AGENT_PLAIN=1. Messages are passed as Text, never as markup,
 # so brackets in branch names or agent-written text print literally.
+#
+# Rich output is themed like Claude Code: each command's output is collected
+# into rounded, Claude-orange boxes (one per heading) and printed when the box
+# closes: at the next heading, before a prompt or a streaming command, or at exit.
+
+CLAUDE = "#D97757"  # Claude's terracotta orange
+CRAB = (" ▐▛███▜▌ ", "▝▜█████▛▘", "  ▘▘ ▝▝  ")
 
 try:
     if os.environ.get("AGENT_PLAIN") == "1" or sys.argv[1:2] == ["__complete"]:
         raise ImportError
     from rich import box
-    from rich.console import Console
+    from rich.console import Console, Group
     from rich.panel import Panel
     from rich.table import Table
     from rich.text import Text
     from rich.theme import Theme
-    THEME = Theme({"ok": "bold green", "warn": "bold yellow", "bad": "bold red", "head": "bold cyan",
-                   "muted": "dim", "name": "bold green", "path": "cyan", "sha": "yellow", "cmd": "bold magenta"})
-    OUT = Console(highlight=False, soft_wrap=True, theme=THEME)
-    ERR = Console(stderr=True, highlight=False, soft_wrap=True, theme=THEME)
+    THEME = Theme({"ok": "bold #4EBA65", "warn": "bold #FFC107", "bad": "bold #FF6B80", "head": f"bold {CLAUDE}",
+                   "claude": CLAUDE, "muted": "#999999", "name": "bold #4EBA65", "path": "#B1B9F9",
+                   "sha": "#FFC107", "cmd": f"bold {CLAUDE}", "frame": CLAUDE})
+    OUT = Console(highlight=False, theme=THEME)
+    ERR = Console(stderr=True, highlight=False, theme=THEME)
 except ImportError:
     OUT = ERR = None
 
@@ -95,18 +103,60 @@ try:
     from rich_argparse import RawDescriptionRichHelpFormatter as RichHelpFormatter
 
     class HELP_FORMAT(RichHelpFormatter):
-        styles = {**RichHelpFormatter.styles, "argparse.groups": "bold cyan", "argparse.args": "green",
-                  "argparse.metavar": "yellow", "argparse.prog": "bold magenta", "argparse.syntax": "bold"}
+        styles = {**RichHelpFormatter.styles, "argparse.groups": f"bold {CLAUDE}", "argparse.args": "#4EBA65",
+                  "argparse.metavar": "#FFC107", "argparse.prog": f"bold {CLAUDE}", "argparse.syntax": f"bold {CLAUDE}",
+                  "argparse.help": "default", "argparse.text": "default"}
         highlights = [*RichHelpFormatter.highlights, r"(?P<syntax>`[^`]+`)"]
 except ImportError:
     HELP_FORMAT = argparse.RawDescriptionHelpFormatter
+
+_box: list | None = None  # [title, [renderables], border style] while a box is open
+
+
+def emit(renderable) -> None:
+    if _box is not None:
+        _box[1].append(renderable)
+    else:
+        OUT.print(renderable)
+
+
+def close_box() -> None:
+    global _box
+    if _box is None or OUT is None:
+        _box = None
+        return
+    title, items, style = _box
+    _box = None
+    if not items:
+        items = [Text("")]
+    OUT.print(Panel(Group(*items), title=title, title_align="left", border_style=style,
+                    box=box.ROUNDED, padding=(0, 1), expand=False))
+
+
+def open_box(title, style: str = "frame") -> None:
+    global _box
+    close_box()
+    _box = [title, [], style]
+
+
+def hang(prefix: Text, body: Text):
+    """prefix + body, with wrapped lines of body indented under its first line."""
+    if not prefix.plain:
+        return body
+    g = Table.grid()
+    g.add_column(no_wrap=True)
+    g.add_column(overflow="fold")
+    g.add_row(prefix, body)
+    return g
 
 
 def _say(console, plain_prefix: str, rich_prefix: tuple[str, str], msg: str, style: str = "", err=False) -> None:
     if console is None:
         print(f"{plain_prefix}{msg}", file=sys.stderr if err else sys.stdout)
+    elif _box is not None:
+        emit(hang(Text(*rich_prefix), Text(msg, style)))
     else:
-        console.print(Text.assemble(rich_prefix, (msg, style)))
+        console.print(hang(Text(*rich_prefix), Text(msg, style)))
 
 
 def ok(msg: str) -> None:
@@ -115,6 +165,10 @@ def ok(msg: str) -> None:
 
 def note(msg: str) -> None:
     _say(OUT, "  ", ("  ", ""), msg, "muted")
+
+
+def say(msg: str, style: str = "") -> None:
+    _say(OUT, "", ("", ""), msg, style)
 
 
 def bullet(sign: str, msg: str, style: str = "ok") -> None:
@@ -127,27 +181,55 @@ def hint(label: str, command: str) -> None:
     if OUT is None:
         print(f"  {label}: {command}")
     else:
-        OUT.print(Text.assemble(("  " + label + ": ", "muted"), (command, "cmd")))
+        emit(hang(Text("  ⎿ ", "muted"), Text.assemble((label + "  ", "muted"), (command, "cmd"))))
 
 
 def warn(msg: str) -> None:
-    _say(ERR, "! ", ("! ", "warn"), msg, err=True)
+    _say(ERR, "! ", ("⚠ ", "warn"), msg, err=True)
 
 
 def error(msg: str) -> None:
-    _say(ERR, "✗ ", ("✗ ", "bad"), msg, err=True)
+    if ERR is None:
+        print(f"✗ {msg}", file=sys.stderr)
+        return
+    close_box()
+    ERR.print(Panel(Text(msg), title=Text("✗ error", "bad"), title_align="left", border_style="bad",
+                    box=box.ROUNDED, padding=(0, 1), expand=False))
 
 
 def heading(msg: str) -> None:
     if OUT is None:
         print(msg)
     else:
-        OUT.print()
-        OUT.print(Text.assemble(("▌ ", "cyan"), (msg, "head")))
+        open_box(Text.assemble(("✻ ", "claude"), (msg, "bold")))
+
+
+def subheading(msg: str) -> None:
+    """A section title inside the current box."""
+    if OUT is None:
+        print(msg)
+    else:
+        emit(Text.assemble(("\n" if _box and _box[1] else "", ""), ("● ", "claude"), (msg, "bold")))
+
+
+def banner(lines: list) -> None:
+    """The crab, with up to three lines of text beside it, in a box (Claude Code's welcome look)."""
+    if OUT is None:
+        for line in lines:
+            print(line if isinstance(line, str) else line[0])
+        return
+    close_box()
+    grid = Table.grid(padding=(0, 2))
+    grid.add_column(style="claude", no_wrap=True)
+    grid.add_column()
+    lines = [*lines, "", "", ""][:3]
+    for crab, line in zip(CRAB, lines):
+        grid.add_row(crab, Text(*(line if isinstance(line, tuple) else (line, ""))))
+    OUT.print(Panel(grid, border_style="frame", box=box.ROUNDED, padding=(0, 1), expand=False))
 
 
 def table(columns: list[str], rows: list[list], styles: list[str] | None = None) -> None:
-    """A borderless table; plain mode aligns columns with spaces. Cells may be (text, style) pairs."""
+    """A table; plain mode aligns columns with spaces. Cells may be (text, style) pairs."""
     cell = lambda c: c if isinstance(c, tuple) else (str(c), "")
     if OUT is None:
         rows_ = [[cell(c)[0] for c in r] for r in rows]
@@ -155,12 +237,12 @@ def table(columns: list[str], rows: list[list], styles: list[str] | None = None)
         for r in [columns, *rows_]:
             print("  " + "  ".join(str(c).ljust(w) for c, w in zip(r, widths)).rstrip())
         return
-    t = Table(box=box.SIMPLE_HEAD, show_edge=False, header_style="bold", pad_edge=False, border_style="dim")
+    t = Table(box=box.ROUNDED, header_style="bold", border_style="muted", pad_edge=True)
     for i, c in enumerate(columns):
         t.add_column(c, style=(styles or [""] * len(columns))[i], overflow="fold")
     for r in rows:
         t.add_row(*[Text(*cell(c)) for c in r])
-    OUT.print(t)
+    emit(t)
 
 
 def kv(rows: list[list]) -> None:
@@ -175,22 +257,23 @@ def kv(rows: list[list]) -> None:
     t.add_column()
     for label, value in rows:
         t.add_row(Text(label), Text(*(value if isinstance(value, tuple) else (str(value), ""))))
-    OUT.print(t)
+    emit(t)
 
 
 def panel(text: str, title: str) -> None:
     if OUT is None:
         print(f"── {title} ──\n{text}\n")
     else:
-        OUT.print(Panel(Text(text), title=Text(title, "head"), title_align="left", border_style="cyan",
-                        expand=False, padding=(0, 1)))
+        emit(Panel(Text(text), title=Text(title, "bold"), title_align="left", border_style="muted",
+                   box=box.ROUNDED, expand=False, padding=(0, 1)))
 
 
 class status:
     """A spinner while something slow runs (Rich only)."""
 
     def __init__(self, msg: str):
-        self.s = OUT.status(Text(msg), spinner="dots") if OUT is not None and OUT.is_terminal else None
+        self.s = OUT.status(Text(msg, "claude"), spinner="dots", spinner_style="claude") \
+            if OUT is not None and OUT.is_terminal else None
 
     def __enter__(self):
         if self.s:
@@ -210,7 +293,8 @@ def ask(question: str, default: str = "") -> str:
     if OUT is None:
         answer = input(f"{question}{shown}: ")
     else:
-        answer = OUT.input(Text.assemble(("? ", "head"), (question, "bold"), (shown, "muted"), ": "))
+        close_box()
+        answer = OUT.input(Text.assemble(("❯ ", "claude"), (question, "bold"), (shown, "muted"), " "))
     return answer.strip() or default
 
 
@@ -240,6 +324,8 @@ def clean_env() -> dict:
 
 def run(cmd, *, check=True, capture=True):
     cmd = [str(c) for c in cmd]
+    if not capture:
+        close_box()
     p = subprocess.run(cmd, env=clean_env(), text=True, capture_output=capture)
     if check and p.returncode:
         detail = ((p.stderr or "") + (p.stdout or "")).strip() if capture else ""
@@ -549,6 +635,8 @@ def cmd_push(a) -> None:
     name, src = resolve_project(a.project)
     push_mirror(src, name)
     settle(src, name)
+    if not a.quiet:
+        heading(f"Push to the agent · {name}")
     if a.wip:
         branch = out(src, "branch", "--show-current") or "detached"
         sha = out(src, "stash", "create")
@@ -677,9 +765,9 @@ def cmd_review(a) -> None:
     stat = out(src, "diff", "--shortstat", base, ref)
     if stat and OUT is not None:
         line = Text("  " + stat, style="muted")
-        line.highlight_regex(r"\d+ insertions?\(\+\)", "green")
-        line.highlight_regex(r"\d+ deletions?\(-\)", "red")
-        OUT.print(line)
+        line.highlight_regex(r"\d+ insertions?\(\+\)", "ok")
+        line.highlight_regex(r"\d+ deletions?\(-\)", "bad")
+        emit(line)
     elif stat:
         note(stat)
     _, patch = close_review(src, name, task)
@@ -721,6 +809,7 @@ def cmd_merge(a) -> None:
         ok(f"agent/{task} is already merged; nothing new to take")
         return
     _, patch = close_review(src, name, task)
+    heading(f"Merge agent/{task}")
 
     if a.merge:  # opt-in: keep the agent's own commits in your history
         p = git(src, "merge", "--no-ff", "-m", f"Merge agent/{task}", ref, check=False, capture=False)
@@ -776,7 +865,8 @@ def cmd_merge(a) -> None:
 def cmd_list(_a) -> None:
     reg = load_registry()
     if not reg:
-        print("No shared repos. Share one: agent share PATH --yes")
+        note("No shared repos yet.")
+        hint("Share one", "agent share PATH --yes")
         return
     rows = []
     for name, info in sorted(reg.items()):
@@ -799,12 +889,13 @@ def cmd_unshare(a) -> None:
     if src.is_dir() and git(src, "remote", "get-url", "agent", check=False).returncode == 0:
         git(src, "fetch", "--prune", "--quiet", "agent", check=False)
         pending = [t for t in agent_tasks(src) if task_state(src, name, t) != "merged"]
-    print(f"Unshare {name}: deletes the mirror, the agent's clone and handoffs; removes the remote and hooks from your repo.")
+    heading(f"Unshare {name}")
+    say("Deletes the mirror, the agent's clone and handoffs; removes the remote and hooks from your repo.")
     if pending:
         warn(f"unmerged agent branches will be lost: {', '.join(pending)}")
     if not a.yes:
         if input(f"Type {name} to confirm: ").strip() != name:
-            print("Cancelled.")
+            say("Cancelled.", "muted")
             return
     if src.is_dir():
         for task in agent_tasks(src):
@@ -957,6 +1048,7 @@ def cmd_setup(a) -> None:
     if not a.no_build or not a.no_start:
         preflight()
     choose_home(a)
+    heading("Setup")
     for d in dirs().values():
         d.mkdir(parents=True, exist_ok=True)
     write_env()
@@ -991,10 +1083,11 @@ def cmd_doctor(_a) -> None:
         if OUT is None:
             print(f"  {mark} {label}{tail}")
         else:
-            OUT.print(Text.assemble((f"  {mark} ", {"good": "ok", "warn": "warn", "bad": "bad"}[state]),
-                                    label, (tail, "yellow")))
+            emit(hang(Text(f"  {mark} ", {"good": "ok", "warn": "warn", "bad": "bad"}[state]),
+                      Text.assemble(label, (tail, "muted"))))
 
-    heading("Tools")
+    heading("agent doctor")
+    subheading("Tools")
     docker = shutil.which("docker") is not None
     check("git installed", shutil.which("git") is not None)
     check("docker installed", docker)
@@ -1008,7 +1101,7 @@ def cmd_doctor(_a) -> None:
     check("shell completion installed", any(f.exists() for f in completion_targets().values()),
           "agent completion install", level="warn")
 
-    heading("Container")
+    subheading("Container")
     reachable = docker and run(["docker", "info"], check=False).returncode == 0
     if docker:
         check("docker daemon reachable", reachable)
@@ -1020,7 +1113,7 @@ def cmd_doctor(_a) -> None:
         check("logged in to Claude", bool(re.search(r'"loggedIn":\s*true', st)), "agent login")
     check("vault exists", (dirs()["vault"] / ".git").is_dir(), "agent setup")
 
-    heading("Storage")
+    subheading("Storage")
     d = disk(AGENT_HOME)
     if d:
         check(f"agent data: {human(d[0])} free at {AGENT_HOME}", d[0] >= LOW_FREE,
@@ -1036,7 +1129,7 @@ def cmd_doctor(_a) -> None:
               f"agent storage clean (frees up to {human(sum(i['size'] for i in old))})", level="warn")
 
     if load_registry():
-        heading("Projects")
+        subheading("Projects")
     for name, info in sorted(load_registry().items()):
         src = Path(info["source"])
         url = git(src, "remote", "get-url", "agent", check=False).stdout.strip() if src.is_dir() else ""
@@ -1044,7 +1137,7 @@ def cmd_doctor(_a) -> None:
               src.is_dir() and mirror_of(name).is_dir() and work_of(name).is_dir() and url == str(work_of(name)),
               f"agent unshare --project {name} --yes, then share again")
 
-    print()
+    close_box()
     if counts["bad"]:
         error(f"{counts['bad']} problem(s), {counts['warn']} warning(s)")
     elif counts["warn"]:
@@ -1333,7 +1426,7 @@ def cmd_storage_move(a) -> None:
     if d and d[0] < size * 1.1:
         raise Fail(f"not enough space at {new}")
     if not a.yes and not (interactive() and confirm("Stop the container and move it?", True)):
-        print("Cancelled. Re-run with --yes to move.")
+        say("Cancelled. Re-run with --yes to move.", "muted")
         return
     prepare_home(new)
     was_running = shutil.which("docker") is not None and container_running()
@@ -1399,8 +1492,8 @@ def cmd_docker_move(a) -> None:
         print("\n".join(f"  {s}" for s in steps))
     else:
         from rich.syntax import Syntax
-        OUT.print(Panel(Syntax("\n".join(steps), "bash", theme="ansi_dark", background_color="default"),
-                        border_style="cyan", expand=False))
+        emit(Panel(Syntax("\n".join(steps), "bash", theme="ansi_dark", background_color="default"),
+                   border_style="muted", box=box.ROUNDED, expand=False))
     note("rsync must be installed. After this, `agent up` starts the container from the moved data.")
 
 
@@ -1410,18 +1503,43 @@ def cmd_docker_move(a) -> None:
 # scripts below call it; `agent completion install` puts one where your shell looks.
 
 def completion_targets() -> dict[str, Path]:
-    return {"bash": DATA_DIR / "bash-completion" / "completions" / "agent",
+    return {"bash": DATA_DIR / "agent" / "completion.bash",
             "zsh": DATA_DIR / "agent" / "completion.zsh",
             "fish": Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "fish" / "completions" / "agent.fish"}
 
 
 def _project_for(words: list[str]) -> tuple[str, Path] | None:
+    """--project, else the shared repo you're in (or its agent clone or review copy), else the only one."""
+    reg = load_registry()
     try:
         if "--project" in words[:-1]:
             return resolve_project(words[words.index("--project") + 1])
         return resolve_project(None)
     except (Fail, IndexError, OSError, ValueError):
-        return None
+        pass
+    cwd = Path.cwd().resolve()
+    for name, info in reg.items():
+        for d in (work_of(name), AGENT_HOME / "review" / name):
+            d = d.resolve()
+            if cwd == d or d in cwd.parents:
+                return name, Path(info["source"])
+    if len(reg) == 1:
+        name, info = next(iter(reg.items()))
+        return name, Path(info["source"])
+    return None
+
+
+def task_names(name: str, src: Path) -> list[tuple[str, str]]:
+    """(task, last commit subject) from the agent's own clone, so tasks show up before `agent pull`."""
+    found: dict[str, str] = {}
+    for repo, prefix in ((src, "refs/remotes/agent/"), (work_of(name), "refs/heads/agent/")):
+        if not repo.is_dir():
+            continue
+        p = git(repo, "for-each-ref", "--sort=-committerdate", "--format=%(refname)\t%(subject)", prefix, check=False)
+        for line in p.stdout.splitlines():
+            ref, _, subject = line.partition("\t")
+            found[ref.removeprefix(prefix)] = subject
+    return list(found.items())
 
 
 def complete_values(act: argparse.Action, words: list[str]) -> list[tuple[str, str, str]]:
@@ -1436,9 +1554,7 @@ def complete_values(act: argparse.Action, words: list[str]) -> list[tuple[str, s
     if not proj:
         return []
     if dest == "task":
-        p = git(proj[1], "for-each-ref", "--format=%(refname:strip=3)\t%(subject)", "refs/remotes/agent/",
-                check=False)
-        return [(*line.split("\t", 1), "task") for line in p.stdout.splitlines() if "\t" in line]
+        return [(t, subject, "task") for t, subject in task_names(*proj)]
     if dest == "base":
         p = git(proj[1], "for-each-ref", "--format=%(refname:short)", "refs/heads", "refs/tags", check=False)
         return [(r, "", "ref") for r in ["HEAD", *p.stdout.split()]]
@@ -1482,21 +1598,32 @@ def complete(words: list[str]) -> list[tuple[str, str, str]]:
 COMPLETION_SCRIPTS = {
     "bash": r"""# agent shell completion for bash (generated by: agent completion bash)
 _agent() {
-  local cur=${COMP_WORDS[COMP_CWORD]} value desc group
+  local cur=${COMP_WORDS[COMP_CWORD]} value desc group width=${COLUMNS:-80} longest=0
+  local -a values descs
   COMPREPLY=()
   while IFS=$'\t' read -r value desc group; do
     case $value in
       :files) compopt -o filenames 2>/dev/null; mapfile -t -O "${#COMPREPLY[@]}" COMPREPLY < <(compgen -f -- "$cur") ;;
       :dirs)  compopt -o filenames 2>/dev/null; mapfile -t -O "${#COMPREPLY[@]}" COMPREPLY < <(compgen -d -- "$cur") ;;
-      *) COMPREPLY+=("$value") ;;
+      *) values+=("$value"); descs+=("$desc"); (( ${#value} > longest )) && longest=${#value} ;;
     esac
   done < <(agent __complete bash "${COMP_WORDS[@]:1:COMP_CWORD}" 2>/dev/null)
+  if (( ${#values[@]} == 1 )); then
+    COMPREPLY+=("${values[0]}")
+  elif (( ${#values[@]} > 1 )); then
+    # Several matches: list each with its description, one per line (the way zsh and fish do).
+    local i line
+    for i in "${!values[@]}"; do
+      line=$(printf '%-*s' "$longest" "${values[i]}")
+      [[ -n ${descs[i]} ]] && line+="  -- ${descs[i]}"
+      COMPREPLY+=("$(printf '%-*.*s' "$((width - 1))" "$((width - 1))" "$line")")
+    done
+  fi
 }
 complete -F _agent agent
 # Highlight the part you've typed in the list of matches (AGENT_COMPLETION_COLORS=0 to skip).
 if [[ $- == *i* && ${AGENT_COMPLETION_COLORS:-1} != 0 ]]; then
   bind 'set colored-completion-prefix on' 2>/dev/null
-  bind 'set colored-stats on' 2>/dev/null
 fi
 """,
     "zsh": r"""# agent shell completion for zsh (generated by: agent completion zsh)
@@ -1549,7 +1676,7 @@ end
 complete -c agent -f -a '(__agent_complete)'
 """,
 }
-ZSHRC_LINE = "[ -r {f} ] && source {f}  # agent shell completion"
+RC_LINE = "[ -r {f} ] && . {f}  # agent shell completion"
 
 
 def cmd_complete(argv: list[str]) -> None:
@@ -1574,17 +1701,19 @@ def cmd_completion(a) -> None:
     f = completion_targets()[shell]
     f.parent.mkdir(parents=True, exist_ok=True)
     f.write_text(COMPLETION_SCRIPTS[shell])
+    heading("Tab completion")
     ok(f"{shell} completion installed: {f}")
-    if shell == "zsh":
-        rc = Path(os.environ.get("ZDOTDIR") or Path.home()) / ".zshrc"
-        line = ZSHRC_LINE.format(f=shlex.quote(str(f)))
+    old = DATA_DIR / "bash-completion" / "completions" / "agent"  # earlier location; would load an old copy
+    if shell == "bash" and old.exists() and "agent __complete" in old.read_text():
+        old.unlink()
+    if shell in ("bash", "zsh"):
+        rc = Path(os.environ.get("ZDOTDIR") or Path.home()) / ".zshrc" if shell == "zsh" else Path.home() / ".bashrc"
+        line = RC_LINE.format(f=shlex.quote(str(f)))
         text = rc.read_text() if rc.exists() else ""
         if line not in text:
             rc.write_text(text + ("" if text.endswith("\n") or not text else "\n") + line + "\n")
             note(f"added a line to {rc} that loads it")
-    elif shell == "bash":
-        note("bash-completion loads it automatically (Ubuntu/Debian have it by default).")
-    note("Open a new terminal, then try: agent <Tab><Tab>")
+    hint("Open a new terminal (or run: exec " + shell + "), then try", "agent review <Tab><Tab>")
 
 
 # ---------------------------------------------------------------- main
@@ -1691,6 +1820,28 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
+def tilde(path: Path) -> str:
+    try:
+        return "~/" + str(Path(path).relative_to(Path.home()))
+    except ValueError:
+        return str(path)
+
+
+def welcome() -> None:
+    """`agent` with no command: who/where, then the main commands."""
+    reg = load_registry()
+    up = shutil.which("docker") is not None and container_running()
+    banner([("agent", "bold"),
+            (f"{tilde(AGENT_HOME)}  ·  {len(reg)} shared repo{'s' * (len(reg) != 1)}", "muted"),
+            ("● container running", "ok") if up else ("○ container stopped  (agent up)", "muted")])
+    heading("Commands")
+    for cmd, what in (("agent pull", "see what the agent did"), ("agent review <task>", "handoff + changes in VS Code"),
+                      ("agent merge <task>", "take the changes, staged"), ("agent share PATH --yes", "give it a repo"),
+                      ("agent storage", "disk space"), ("agent doctor", "health check"), ("agent --help", "everything")):
+        emit(Text.assemble(("  " + cmd.ljust(24), "cmd"), (what, "muted")))
+    close_box()
+
+
 def main(argv=None) -> None:
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ["__complete"]:
@@ -1699,9 +1850,12 @@ def main(argv=None) -> None:
     ap = build_parser()
     a = ap.parse_args(argv)
     if not getattr(a, "fn", None):
-        ap.print_help()
+        welcome()
         return
-    a.fn(a)
+    try:
+        a.fn(a)
+    finally:
+        close_box()
 
 
 if __name__ == "__main__":
