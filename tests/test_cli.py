@@ -19,13 +19,15 @@ class CliTest(unittest.TestCase):
     def agent(self, *args, check=True, cwd=None):
         return self.s.run("python3", CLI, *args, cwd=cwd or self.user, check=check)
 
-    def agent_commit(self, branch, rel, text):
-        """Plays the agent: commit on agent/<task> in its clone."""
+    def agent_commit(self, branch, rel, text, new_branch=True):
+        """Plays the agent: commit on agent/<task> in its clone, with a co-author trailer."""
         work = self.agent_home / "work" / "myrepo"
-        self.s.git(work, "switch", "-q", "-c", branch)
+        if new_branch:
+            self.s.git(work, "switch", "-q", "-c", branch)
         (work / rel).write_text(text)
         self.s.git(work, "add", "-A")
-        self.s.git(work, "commit", "-q", "-m", f"agent: {rel}")
+        self.s.git(work, "commit", "-q", "-m", f"agent: {rel}", "-m",
+                   "Co-Authored-By: Claude <noreply@anthropic.com>")
 
     def share(self):
         self.agent("share", "--yes")
@@ -97,9 +99,76 @@ class CliTest(unittest.TestCase):
         self.assertIn("uncommitted changes", self.agent("merge", "uart-fix", check=False).stderr)
         self.s.git(self.user, "reset", "-q", "dirty.txt")
 
-        self.agent("merge", "uart-fix")
+        out = self.agent("merge", "uart-fix").stdout
+        self.assertIn("staged in your repo, not committed", out)
         self.assertEqual((self.user / "src" / "a.txt").read_text(), "two\n")
         self.assertFalse(wt.exists())
+        self.assertIn("staged; commit to finish", self.agent("pull").stdout)
+        self.s.git(self.user, "commit", "-q", "--no-edit")
+        self.assertIn("merged", self.agent("pull").stdout)
+
+    def last_commit(self, fmt):
+        return self.s.git(self.user, "log", "-1", f"--format={fmt}").stdout
+
+    def test_merge_is_a_squash_authored_by_you_without_coauthors(self):
+        self.share()
+        self.agent_commit("agent/split", "src/a.txt", "two\n")
+        self.agent("merge", "split")
+        self.assertNotEqual(self.s.git(self.user, "rev-parse", "-q", "--verify", "MERGE_HEAD", check=False).returncode, 0)
+        msg = (self.user / ".git" / "SQUASH_MSG").read_text()
+        self.assertEqual(msg, "agent: src/a.txt\n")
+        self.s.git(self.user, "commit", "-q", "--no-edit")   # what VS Code's Commit does with the pre-filled message
+        self.assertEqual(len(self.last_commit("%P").split()), 1)  # no merge commit
+        self.assertEqual(self.last_commit("%an <%ae>").strip(), "Tester <t@example.com>")
+        self.assertNotIn("Co-Authored-By", self.last_commit("%B"))
+        self.assertNotIn("Claude", self.s.git(self.user, "log", "--format=%an%n%B", "main").stdout)
+        self.assertFalse((self.user / ".git" / "SQUASH_MSG").exists())
+        self.assertIn("merged", self.agent("pull").stdout)
+        mirror = self.agent_home / "mirrors" / "myrepo.git"
+        self.assertEqual(self.s.git(mirror, "rev-parse", "refs/merged/split").stdout,
+                         self.s.git(self.user, "rev-parse", "refs/remotes/agent/split").stdout)
+        self.assertIn("already merged", self.agent("merge", "split").stdout)
+
+    def test_merge_commit_flag_and_multi_commit_message(self):
+        self.share()
+        self.agent_commit("agent/fir-pipeline", "src/a.txt", "two\n")
+        self.agent_commit("agent/fir-pipeline", "b.txt", "b\n", new_branch=False)
+        out = self.agent("merge", "fir-pipeline", "--commit").stdout
+        self.assertIn("committed as you: Fir pipeline", out)
+        self.assertEqual(self.last_commit("%B").strip(), "Fir pipeline\n\n- agent: src/a.txt\n- agent: b.txt")
+        self.assertIn("merged", self.agent("pull").stdout)
+
+    def test_abandoned_squash_is_forgotten(self):
+        self.share()
+        self.agent_commit("agent/x", "src/a.txt", "two\n")
+        self.agent("merge", "x")
+        self.assertIn("already in progress", self.agent("merge", "x", check=False).stderr)
+        self.s.git(self.user, "reset", "-q", "--merge")
+        self.assertFalse((self.user / ".git" / "SQUASH_MSG").exists())
+        self.assertIn("1 new", self.agent("pull").stdout)
+        self.assertIn("staged in your repo", self.agent("merge", "x").stdout)
+
+    def test_follow_up_commits_after_a_merge(self):
+        self.share()
+        self.agent_commit("agent/x", "src/a.txt", "two\n")
+        self.agent("merge", "x", "--commit")
+        # The agent adds to the same task without rebasing first.
+        self.agent_commit("agent/x", "c.txt", "c\n", new_branch=False)
+        self.assertIn("1 new since merge", self.agent("pull").stdout)
+        review = self.agent("review", "x", "--no-open").stdout
+        self.assertIn("new since you last merged", review)
+        wt = self.agent_home / "review" / "myrepo" / "x"
+        self.assertEqual(self.s.git(wt, "diff", "--cached", "--name-only").stdout.split(), ["c.txt"])
+        self.agent("merge", "x", "--commit")
+        self.assertEqual(self.s.git(self.user, "show", "--name-only", "--format=", "HEAD").stdout.split(), ["c.txt"])
+        self.assertEqual((self.user / "src" / "a.txt").read_text(), "two\n")
+        self.assertIn("merged", self.agent("pull").stdout)
+
+    def test_real_merge_is_opt_in(self):
+        self.share()
+        self.agent_commit("agent/x", "src/a.txt", "two\n")
+        self.agent("merge", "x", "--merge")
+        self.assertEqual(len(self.last_commit("%P").split()), 2)
         self.assertIn("merged", self.agent("pull").stdout)
 
     def test_merge_conflict_leaves_real_merge_state(self):
@@ -110,27 +179,14 @@ class CliTest(unittest.TestCase):
         p = self.agent("merge", "x", check=False)
         self.assertEqual(p.returncode, 1)
         self.assertIn("Merge Changes", p.stderr)
+        self.assertIn("git reset --merge", p.stdout)
         # Unmerged index entries: this is what VS Code's merge editor needs.
         self.assertIn("src/a.txt", self.s.git(self.user, "diff", "--name-only", "--diff-filter=U").stdout)
-        self.s.git(self.user, "merge", "--abort")
+        self.s.git(self.user, "reset", "-q", "--merge")
 
     def test_review_unknown_task(self):
         self.share()
         self.assertIn("no agent branch", self.agent("review", "nope", "--no-open", check=False).stderr)
-
-    def test_merge_edit_lets_you_fix_before_committing(self):
-        self.share()
-        self.agent_commit("agent/rename", "src/a.txt", "agent_name = 1\n")
-        out = self.agent("merge", "rename", "--edit").stdout
-        self.assertIn("started, not committed", out)
-        self.assertEqual(self.s.git(self.user, "rev-parse", "-q", "--verify", "MERGE_HEAD", check=False).returncode, 0)
-        # Your small fix, then your commit.
-        (self.user / "src" / "a.txt").write_text("better_name = 1\n")
-        self.s.git(self.user, "commit", "-q", "-am", "Merge agent/rename with a rename")
-        parents = self.s.git(self.user, "log", "-1", "--format=%P").stdout.split()
-        self.assertEqual(len(parents), 2)
-        self.assertEqual(self.s.git(self.user, "show", "HEAD:src/a.txt").stdout, "better_name = 1\n")
-        self.assertIn("merged", self.agent("pull").stdout)
 
     def test_edits_in_review_copy_are_carried_into_merge(self):
         self.share()
@@ -139,7 +195,7 @@ class CliTest(unittest.TestCase):
         wt = self.agent_home / "review" / "myrepo" / "x"
         (wt / "src" / "a.txt").write_text("agent, renamed by me\n")
         (wt / "NEW.md").write_text("my note\n")
-        out = self.agent("merge", "x", "--edit").stdout
+        out = self.agent("merge", "x").stdout
         self.assertIn("applied the edits you made in the review copy", out)
         self.assertEqual((self.user / "src" / "a.txt").read_text(), "agent, renamed by me\n")
         self.assertEqual((self.user / "NEW.md").read_text(), "my note\n")
@@ -170,15 +226,9 @@ class CliTest(unittest.TestCase):
         self.agent("review", "x", "--no-open")
         self.assertNotIn("saved", self.agent("review", "x", "--close").stderr)
 
-    def test_merge_of_already_merged_task(self):
+    def test_merge_modes_are_exclusive(self):
         self.share()
-        self.agent_commit("agent/x", "src/a.txt", "agent\n")
-        self.agent("merge", "x")
-        self.assertIn("already merged", self.agent("merge", "x").stdout)
-
-    def test_edit_and_squash_are_exclusive(self):
-        self.share()
-        self.assertNotEqual(self.agent("merge", "x", "--edit", "--squash", check=False).returncode, 0)
+        self.assertNotEqual(self.agent("merge", "x", "--commit", "--merge", check=False).returncode, 0)
 
     def test_unshare_cleans_up(self):
         self.share()

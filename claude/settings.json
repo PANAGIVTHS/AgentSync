@@ -1,4 +1,5 @@
 {
+  "attribution": { "commit": "", "pr": "", "sessionUrl": false },
   "permissions": {
     "defaultMode": "acceptEdits",
     "allow": ["Bash", "Read", "Edit", "Write", "Glob", "Grep", "WebFetch", "WebSearch"],

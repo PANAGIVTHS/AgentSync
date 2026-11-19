@@ -47,7 +47,9 @@ class RichOutputTest(unittest.TestCase):
     def test_help_renders(self):
         out = self.agent("--help").stdout
         self.assertIn("merge", out)
-        self.assertIn("--edit", self.agent("merge", "--help").stdout)
+        merge_help = self.agent("merge", "--help").stdout
+        self.assertIn("--commit", merge_help)
+        self.assertNotIn("--edit", merge_help)  # old spelling still works, but isn't advertised
 
 
 if __name__ == "__main__":

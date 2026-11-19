@@ -3,6 +3,11 @@
 
 Doing these steps in a script keeps them identical every time and costs a few
 lines of output instead of many tool calls. Run from inside /work/<project>.
+
+The user takes the agent's work as files (a squash), so the agent's commits never
+enter their history. When they do, `agent merge` records the commit it took as
+desktop-merged/<task>. Using that marker, a resumed task restarts from the user's
+latest work, and follow-up commits are rebased onto it, so nothing is offered twice.
 """
 import argparse
 import os
@@ -12,6 +17,9 @@ import sys
 from pathlib import Path
 
 HANDOFFS = Path(os.environ.get("AGENT_HANDOFFS", "/handoffs"))
+REFSPECS = ("+refs/heads/*:refs/remotes/desktop/*",
+            "+refs/wip/*:refs/remotes/desktop-wip/*",
+            "+refs/merged/*:refs/remotes/desktop-merged/*")
 
 
 def die(msg: str) -> None:
@@ -28,6 +36,10 @@ def git(*args, check=True) -> str:
 
 def ok(*args) -> bool:
     return subprocess.run(["git", *args], capture_output=True).returncode == 0
+
+
+def ancestor(a: str, b: str) -> bool:
+    return ok("merge-base", "--is-ancestor", a, b)
 
 
 def root() -> Path:
@@ -59,8 +71,16 @@ def base_of(branch: str) -> str:
 
 
 def fetch() -> None:
-    if not ok("fetch", "--prune", "--quiet", "desktop"):
+    if not ok("fetch", "--prune", "--quiet", "desktop", *REFSPECS):
         print("warning: could not fetch the user's latest commits", file=sys.stderr)
+
+
+def merged_marker(task: str) -> str:
+    return git("rev-parse", "-q", "--verify", f"refs/remotes/desktop-merged/{task}", check=False)
+
+
+def dirty() -> bool:
+    return bool(git("status", "--porcelain"))
 
 
 def behind_ahead(base_ref: str, branch: str) -> tuple[int, int]:
@@ -72,13 +92,42 @@ def handoff_file(task: str) -> Path:
     return HANDOFFS / root().name / f"{task}.md"
 
 
+def rebase_onto(base_ref: str, upstream: str, base: str) -> None:
+    p = subprocess.run(["git", "rebase", "--quiet", "--onto", base_ref, upstream], capture_output=True, text=True)
+    if p.returncode:
+        files = git("diff", "--name-only", "--diff-filter=U", check=False)
+        print(f"rebase onto the user's latest {base} hit conflicts in:\n{files}\n"
+              "Resolve them, `git add` the files, `git rebase --continue`, then run this again.")
+        sys.exit(1)
+
+
+def catch_up(branch: str, task: str, base: str) -> None:
+    """If the user already took this task's work, continue from their latest instead."""
+    marker = merged_marker(task)
+    if not marker:
+        return
+    base_ref, tip = f"desktop/{base}", git("rev-parse", "HEAD")
+    if tip == marker or ancestor(tip, marker):
+        if dirty():
+            print(f"note: the user already merged {branch}; commit or discard your changes, then run this again")
+            return
+        git("reset", "--quiet", "--hard", base_ref)
+        print(f"the user merged {branch}; it now starts from their latest {base}")
+    elif ancestor(marker, tip):
+        if dirty():
+            print("note: commit your changes so they can be moved onto the user's latest work")
+            return
+        rebase_onto(base_ref, marker, base)
+        print(f"moved your commits made after the user's merge onto their latest {base}")
+
+
 def cmd_start(a) -> None:
     root()
     fetch()
     task = slug(a.name)
     branch = f"agent/{task}"
     current = git("branch", "--show-current", check=False)
-    if current != branch and git("status", "--porcelain"):
+    if current != branch and dirty():
         if not current.startswith("agent/"):
             die(f"uncommitted changes on {current or 'detached HEAD'}. Commit them on an agent/ branch or discard them")
         git("add", "-A")
@@ -88,9 +137,10 @@ def cmd_start(a) -> None:
         if current != branch:
             git("switch", "--quiet", branch)
         base = base_of(branch)
+        catch_up(branch, task, base)
         behind, ahead = behind_ahead(f"desktop/{base}", branch)
         print(f"resumed {branch} (base {base}: {ahead} commits ahead, {behind} behind the user's latest)")
-        log = git("log", "--oneline", "-3", branch)
+        log = git("log", "--oneline", "-3", f"desktop/{base}..{branch}")
         if log:
             print(log)
     else:
@@ -115,7 +165,12 @@ def cmd_status(_a) -> None:
     for b in branches:
         base = base_of(b)
         task = b.removeprefix("agent/")
-        if ok("rev-parse", "--verify", "-q", f"refs/remotes/desktop/{base}"):
+        marker, tip = merged_marker(task), git("rev-parse", b)
+        if marker and (tip == marker or ancestor(tip, marker)):
+            state = "merged by the user"
+        elif marker and ancestor(marker, tip):
+            state = f"{git('rev-list', '--count', f'{marker}..{tip}')} new since the user merged"
+        elif ok("rev-parse", "--verify", "-q", f"refs/remotes/desktop/{base}"):
             behind, ahead = behind_ahead(f"desktop/{base}", b)
             state = (f"{ahead} ahead, {behind} behind {base}" if ahead
                      else f"nothing new vs {base} (merged or empty)")
@@ -123,36 +178,34 @@ def cmd_status(_a) -> None:
             state = f"base {base} no longer exists"
         mark = "*" if b == current else " "
         ready = "handoff written" if handoff_file(task).exists() else "no handoff"
-        print(f"{mark} {b:<28} {state:<28} {ready}")
+        print(f"{mark} {b:<28} {state:<30} {ready}")
     wip = git("for-each-ref", "--format=%(refname:short)", "refs/remotes/desktop-wip/").split()
     if wip:
         print("user's uncommitted work: " + ", ".join(wip))
-    if git("status", "--porcelain"):
+    if dirty():
         print("working tree has uncommitted changes")
 
 
 def cmd_handoff(_a) -> None:
-    top = root()
+    root()
     branch = git("branch", "--show-current", check=False)
     if not branch.startswith("agent/"):
         die("not on a task branch. Use /task first")
-    if git("status", "--porcelain"):
+    if dirty():
         die("uncommitted changes. Commit them first (git add -A && git commit -m '...')")
     fetch()
     base = base_of(branch)
     base_ref = f"desktop/{base}"
-    if not ok("merge-base", "--is-ancestor", base_ref, "HEAD"):
-        p = subprocess.run(["git", "rebase", "--quiet", base_ref], capture_output=True, text=True)
-        if p.returncode:
-            files = git("diff", "--name-only", "--diff-filter=U", check=False)
-            print(f"rebase onto the user's latest {base} hit conflicts in:\n{files}\n"
-                  "Resolve them, `git add` the files, `git rebase --continue`, then run this again.")
-            sys.exit(1)
-        print(f"rebased onto the user's latest {base}")
     task = branch.removeprefix("agent/")
+    catch_up(branch, task, base)
+    if not ancestor(base_ref, "HEAD"):
+        rebase_onto(base_ref, base_ref, base)
+        print(f"rebased onto the user's latest {base}")
+    commits = git("log", "--oneline", "--no-decorate", f"{base_ref}..HEAD").splitlines()
+    if not commits:
+        die("nothing new to hand off: the user already has all of this task's work")
     f = handoff_file(task)
     f.parent.mkdir(parents=True, exist_ok=True)
-    commits = git("log", "--oneline", "--no-decorate", f"{base_ref}..HEAD").splitlines()
     stat = git("diff", "--stat", f"{base_ref}...HEAD").splitlines()
     print(f"branch {branch} · base {base} · head {git('rev-parse', '--short', 'HEAD')} · {len(commits)} commits")
     for c in commits[:15]:

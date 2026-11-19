@@ -75,6 +75,38 @@ class AgentTaskTest(unittest.TestCase):
         self.assertIn("uncommitted changes", self.task("handoff", check=False).stderr)
         self.assertIn("no user branch 'nope'", self.task("start", "z", "--from", "nope", check=False).stderr)
 
+    def user_squash_merges(self, task):
+        """Plays the host: the user takes agent/<task> as files and commits; the marker is recorded."""
+        sha = self.s.git(self.work, "rev-parse", f"agent/{task}").stdout.strip()
+        self.s.git(self.work, "push", "-q", "--force", self.mirror, f"{sha}:refs/merged/{task}")
+        self.s.git(self.user, "fetch", "-q", self.work, f"agent/{task}")
+        self.s.git(self.user, "merge", "-q", "--squash", "FETCH_HEAD")
+        self.s.git(self.user, "commit", "-q", "-m", "user took the task")
+        self.push()
+
+    def test_after_user_merge_task_restarts_from_their_work(self):
+        self.task("start", "split")
+        self.commit("src/a.txt", "two\n", "split it")
+        self.user_squash_merges("split")
+        self.assertIn("merged by the user", self.task("status").stdout)
+        self.assertIn("nothing new to hand off", self.task("handoff", check=False).stderr)
+        out = self.task("start", "split").stdout
+        self.assertIn("0 commits ahead, 0 behind", out)
+        self.assertEqual(self.s.git(self.work, "rev-parse", "HEAD").stdout,
+                         self.s.git(self.work, "rev-parse", "desktop/main").stdout)
+
+    def test_follow_up_commits_move_onto_the_users_merge(self):
+        self.task("start", "split")
+        self.commit("src/a.txt", "two\n", "split it")
+        self.user_squash_merges("split")
+        self.commit("c.txt", "c\n", "follow-up")  # made before fetching the user's merge
+        self.assertIn("1 new since the user merged", self.task("status").stdout)
+        out = self.task("handoff").stdout
+        self.assertIn("moved your commits made after the user's merge", out)
+        self.assertIn("1 commits", out)
+        log = self.s.git(self.work, "log", "--format=%s", "desktop/main..HEAD").stdout.split("\n")
+        self.assertEqual([line for line in log if line], ["follow-up"])
+
 
 if __name__ == "__main__":
     unittest.main()

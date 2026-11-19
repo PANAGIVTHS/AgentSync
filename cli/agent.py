@@ -267,13 +267,25 @@ def remove_hooks(src: Path) -> None:
 
 # ---------------------------------------------------------------- sharing
 
+class project_lock:
+    """Serializes mirror updates: the auto-push hook runs in the background."""
+
+    def __init__(self, name: str):
+        self.path = AGENT_HOME / f".push-{name}.lock"
+
+    def __enter__(self):
+        self.fh = open(self.path, "w")
+        fcntl.flock(self.fh, fcntl.LOCK_EX)
+
+    def __exit__(self, *exc):
+        self.fh.close()
+
+
 def push_mirror(src: Path, name: str) -> None:
     mirror = mirror_of(name)
     if not mirror.is_dir():
         raise Fail(f"mirror for {name} is missing. Run: agent doctor")
-    lock = AGENT_HOME / f".push-{name}.lock"
-    with open(lock, "w") as fh:
-        fcntl.flock(fh, fcntl.LOCK_EX)
+    with project_lock(name):
         git(src, "push", "--quiet", "--force", "--prune", "--no-verify", mirror,
             "refs/heads/*:refs/heads/*", "refs/tags/*:refs/tags/*")
 
@@ -351,9 +363,80 @@ def cmd_share(a) -> None:
     note(f"First time only: `agent attach`, open window rc-{name}, and accept the folder trust prompt.")
 
 
+# ---------------------------------------------------------------- merge records
+# `agent merge` takes the agent's work as files (a squash), like HermesSync's
+# sync: the agent's commits never enter your history. Once you commit, the
+# agent commit you took is recorded in the mirror as refs/merged/<task>, so
+# `pull` shows the task as merged and the agent continues from your latest work.
+
+def git_path(src: Path, name: str) -> Path:
+    p = Path(out(src, "rev-parse", "--git-path", name))
+    return p if p.is_absolute() else src / p
+
+
+def pending_file(name: str, task: str) -> Path:
+    return AGENT_HOME / "pending" / name / f"{task}.json"
+
+
+def merged_marker(name: str, task: str) -> str:
+    p = git(mirror_of(name), "rev-parse", "-q", "--verify", f"refs/merged/{task}", check=False)
+    return p.stdout.strip()
+
+
+def is_ancestor(src: Path, a: str, b: str) -> bool:
+    return git(src, "merge-base", "--is-ancestor", a, b, check=False).returncode == 0
+
+
+def settle(src: Path, name: str) -> None:
+    """Record staged merges you've since committed; forget ones you abandoned."""
+    folder = AGENT_HOME / "pending" / name
+    if not folder.is_dir():
+        return
+    with project_lock(name):
+        head = out(src, "rev-parse", "HEAD")
+        in_progress = git_path(src, "SQUASH_MSG").exists() or git_path(src, "MERGE_HEAD").exists()
+        for f in folder.glob("*.json"):
+            info = json.loads(f.read_text())
+            if in_progress:
+                continue
+            if head != info["head"]:
+                git(src, "push", "--quiet", "--force", "--no-verify", mirror_of(name),
+                    f"{info['sha']}:refs/merged/{info['task']}")
+            f.unlink()  # recorded, or you undid the staged changes (git reset --merge)
+
+
+def task_state(src: Path, name: str, task: str) -> str:
+    ref = f"refs/remotes/agent/{task}"
+    if pending_file(name, task).exists():
+        return "staged; commit to finish"
+    if is_ancestor(src, ref, "HEAD"):
+        return "merged"
+    marker, sha = merged_marker(name, task), out(src, "rev-parse", ref)
+    if marker and (marker == sha or is_ancestor(src, sha, marker)):
+        return "merged"
+    if marker and is_ancestor(src, marker, sha):
+        return f"{out(src, 'rev-list', '--count', f'{marker}..{sha}')} new since merge"
+    return f"{out(src, 'rev-list', '--count', f'HEAD..{sha}')} new"
+
+
+TRAILER = re.compile(r"(?im)^(co-authored-by|claude-session|signed-off-by|generated with)\b.*\n?")
+
+
+def squash_message(src: Path, task: str, base: str, sha: str) -> str:
+    subjects = [s for s in out(src, "log", "--reverse", "--no-merges", "--format=%s", f"{base}..{sha}").splitlines()
+                if s and not s.startswith("wip: autosave")]
+    if len(subjects) == 1:
+        text = subjects[0] + "\n"
+    else:
+        title = task.replace("-", " ").replace("_", " ").strip().capitalize() or task
+        text = title + "\n\n" + "".join(f"- {s}\n" for s in subjects)
+    return TRAILER.sub("", sanitize(text))
+
+
 def cmd_push(a) -> None:
     name, src = resolve_project(a.project)
     push_mirror(src, name)
+    settle(src, name)
     if a.wip:
         branch = out(src, "branch", "--show-current") or "detached"
         sha = out(src, "stash", "create")
@@ -386,6 +469,7 @@ def require_task(src: Path, task: str) -> str:
 
 def cmd_pull(a) -> None:
     name, src = resolve_project(a.project)
+    settle(src, name)
     fetch_agent(src)
     tasks = agent_tasks(src)
     if not tasks:
@@ -394,14 +478,12 @@ def cmd_pull(a) -> None:
     rows = []
     for task in tasks:
         ref = f"refs/remotes/agent/{task}"
-        new = out(src, "rev-list", "--count", f"HEAD..{ref}")
         subject = sanitize(out(src, "log", "-1", "--format=%s", ref))[:60]
         ready = "written" if handoff_of(name, task).exists() else "-"
-        state = "merged" if new == "0" else f"{new} new"
-        rows.append([f"agent/{task}", state, ready, subject])
+        rows.append([f"agent/{task}", task_state(src, name, task), ready, subject])
     heading(f"Agent branches in {name}")
     table(["Branch", "Commits", "Handoff", "Last commit"], rows, ["bold green", "", "", "dim"])
-    note("Review: agent review <task>    Merge: agent merge <task> [--edit]")
+    note("Review: agent review <task>    Take the changes: agent merge <task>")
 
 
 # ---------------------------------------------------------------- review copies
@@ -456,10 +538,15 @@ def cmd_review(a) -> None:
             note(f"Apply them in your repo any time: git apply --3way {patch}")
         ok("review closed" if existed else "no open review")
         return
+    settle(src, name)
     fetch_agent(src)
     ref = require_task(src, task)
-    base = out(src, "merge-base", a.base, ref)
-    heading(f"Review agent/{task}  (against {a.base} @ {base[:9]})")
+    marker = merged_marker(name, task)
+    if a.base == "HEAD" and marker and is_ancestor(src, marker, ref) and marker != out(src, "rev-parse", ref):
+        base, label = marker, "what's new since you last merged it"
+    else:
+        base, label = out(src, "merge-base", a.base, ref), f"against {a.base}"
+    heading(f"Review agent/{task}  ({label} @ {base[:9]})")
     hand = handoff_of(name, task)
     if hand.exists():
         panel(sanitize(hand.read_text(errors="replace")).strip(), "Handoff")
@@ -491,52 +578,77 @@ def cmd_review(a) -> None:
         subprocess.Popen(["code", "--new-window", str(wt)], stdin=subprocess.DEVNULL,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
         note("opened in VS Code: Source Control lists every change the agent made")
-    note("Small fixes: edit here or after `agent merge --edit`; your edits go into the merge either way.")
-    note(f"Merge: agent merge {task} [--edit]    Close: agent review {task} --close")
+    note("Small fixes: edit here or after `agent merge`; your edits come along either way.")
+    note(f"Take the changes: agent merge {task}    Close: agent review {task} --close")
 
 
 def cmd_merge(a) -> None:
+    """Take the agent's changes as files in your repo, authored by you."""
     name, src = resolve_project(a.project)
     task = normalize_task(a.task)
+    settle(src, name)
+    if git_path(src, "SQUASH_MSG").exists() or git_path(src, "MERGE_HEAD").exists():
+        raise Fail("a merge is already in progress in your repo. Commit it, or undo it with: git reset --merge")
     if out(src, "status", "--porcelain", "--untracked-files=no"):
         raise Fail("your repo has uncommitted changes. Commit or stash them first")
     fetch_agent(src)
     ref = require_task(src, task)
-    if git(src, "merge-base", "--is-ancestor", ref, "HEAD", check=False).returncode == 0:
-        ok(f"agent/{task} is already merged into your branch; nothing to do")
+    sha = out(src, "rev-parse", ref)
+    marker = merged_marker(name, task)
+    if is_ancestor(src, ref, "HEAD") or (marker and (marker == sha or is_ancestor(src, sha, marker))):
+        ok(f"agent/{task} is already merged; nothing new to take")
         return
     _, patch = close_review(src, name, task)
-    if a.squash:
-        args = ["merge", "--squash", ref]
-    elif a.edit:
-        args = ["merge", "--no-ff", "--no-commit", "-m", f"Merge agent/{task}", ref]
+
+    if a.merge:  # opt-in: keep the agent's own commits in your history
+        p = git(src, "merge", "--no-ff", "-m", f"Merge agent/{task}", ref, check=False, capture=False)
+        if p.returncode:
+            warn("merge stopped on conflicts. In VS Code: Source Control → Merge Changes → resolve, then `git commit`.")
+            note("To undo: git merge --abort")
+            sys.exit(1)
+        ok(f"merged agent/{task}, keeping the agent's commits. Push when ready: git push")
+        return
+
+    head = out(src, "rev-parse", "HEAD")
+    if marker and is_ancestor(src, marker, sha):
+        # The agent added commits after you last took this task: take only the new part.
+        base = marker
+        diff = AGENT_HOME / "pending" / f".{name}-{task}.diff"
+        diff.parent.mkdir(parents=True, exist_ok=True)
+        diff.write_text(out(src, "diff", "--binary", marker, sha) + "\n")
+        conflicts = git(src, "apply", "--3way", "--whitespace=nowarn", diff, check=False).returncode != 0
+        diff.unlink()
     else:
-        args = ["merge", "--no-ff", "-m", f"Merge agent/{task}", ref]
-    p = git(src, *args, check=False, capture=False)
-    if p.returncode:
-        warn("merge stopped on conflicts. In VS Code: Source Control → Merge Changes → resolve, then `git commit`.")
-        note("To undo: git merge --abort")
+        base = out(src, "merge-base", "HEAD", sha)
+        conflicts = git(src, "merge", "--squash", ref, check=False).returncode != 0
+    message = squash_message(src, task, base, sha)
+    git_path(src, "SQUASH_MSG").write_text(message)
+    pf = pending_file(name, task)
+    pf.parent.mkdir(parents=True, exist_ok=True)
+    pf.write_text(json.dumps({"task": task, "sha": sha, "head": head}) + "\n")
+
+    if conflicts:
+        warn("some changes conflict with yours. In VS Code: Source Control → Merge Changes → resolve and stage, then commit.")
+        note("To undo: git reset --merge")
         if patch:
             note(f"Your review-copy edits are saved; after resolving, apply them: git apply --3way {patch}")
         sys.exit(1)
-    applied = False
     if patch:
         if apply_patch(src, patch, three_way=True):
             ok("applied the edits you made in the review copy")
             patch.unlink()
-            applied = True
         else:
             warn(f"couldn't apply your review-copy edits cleanly; they're saved in {patch}")
-    if a.edit:
-        ok(f"merge of agent/{task} started, not committed: the agent's changes are staged in your repo")
-        note("Make your fixes in VS Code (rename, tweak), stage them, then `git commit`.")
-        note("To undo everything: git merge --abort")
-    elif a.squash:
-        ok("changes staged as one change. Review them and `git commit`, then `git push` when ready")
-    else:
-        ok(f"merged agent/{task}. Push when ready: git push")
-        if applied:
-            note("Your review-copy edits are staged on top of the merge: check them and `git commit`.")
+    if a.commit:
+        git(src, "commit", "--quiet", "-F", git_path(src, "SQUASH_MSG"))
+        settle(src, name)
+        ok(f"committed as you: {message.splitlines()[0]}")
+        note("Push when ready: git push")
+        return
+    ok(f"agent/{task}'s changes are staged in your repo, not committed")
+    note("Check them in VS Code, fix anything you like, then commit. The message is pre-filled:")
+    note(f"  {message.splitlines()[0]}")
+    note("To undo: git reset --merge")
 
 
 def cmd_list(_a) -> None:
@@ -564,8 +676,7 @@ def cmd_unshare(a) -> None:
     pending = []
     if src.is_dir() and git(src, "remote", "get-url", "agent", check=False).returncode == 0:
         git(src, "fetch", "--prune", "--quiet", "agent", check=False)
-        pending = [t for t in agent_tasks(src)
-                   if out(src, "rev-list", "--count", f"HEAD..refs/remotes/agent/{t}") != "0"]
+        pending = [t for t in agent_tasks(src) if task_state(src, name, t) != "merged"]
     print(f"Unshare {name}: deletes the mirror, the agent's clone and handoffs; removes the remote and hooks from your repo.")
     if pending:
         warn(f"unmerged agent branches will be lost: {', '.join(pending)}")
@@ -575,6 +686,7 @@ def cmd_unshare(a) -> None:
             return
     if src.is_dir():
         for task in agent_tasks(src):
+            pending_file(name, task).unlink(missing_ok=True)
             _, patch = close_review(src, name, task)
             if patch:
                 kept = Path.home() / patch.name
@@ -582,7 +694,8 @@ def cmd_unshare(a) -> None:
                 warn(f"you had edits in the {task} review copy; saved them to {kept}")
         remove_hooks(src)
         git(src, "remote", "remove", "agent", check=False)
-    for p in (mirror_of(name), work_of(name), AGENT_HOME / "handoffs" / name, AGENT_HOME / "review" / name):
+    for p in (mirror_of(name), work_of(name), AGENT_HOME / "handoffs" / name, AGENT_HOME / "review" / name,
+              AGENT_HOME / "pending" / name):
         shutil.rmtree(p, ignore_errors=True)
     reg = load_registry()
     reg.pop(name, None)
@@ -801,12 +914,15 @@ def main(argv=None) -> None:
     s.add_argument("--close", action="store_true", help="remove the review copy")
     s.set_defaults(fn=cmd_review)
 
-    s = sub.add_parser("merge", help="merge a task into your current branch")
+    s = sub.add_parser("merge", help="take a task's changes into your repo as your own (staged, not committed)")
     s.add_argument("task")
     mode = s.add_mutually_exclusive_group()
-    mode.add_argument("--edit", action="store_true",
-                      help="start the merge without committing, so you can make small fixes first")
-    mode.add_argument("--squash", action="store_true", help="stage the task as one change instead of merging")
+    mode.add_argument("--commit", action="store_true",
+                      help="also commit them as you, with the pre-filled message")
+    mode.add_argument("--merge", action="store_true",
+                      help="a real git merge instead, keeping the agent's commits in your history")
+    # Older spellings of the default behaviour.
+    mode.add_argument("--squash", "--edit", action="store_true", dest="legacy", help=argparse.SUPPRESS)
     s.set_defaults(fn=cmd_merge)
 
     s = sub.add_parser("unshare", help="stop sharing a repo and delete the agent's copy")

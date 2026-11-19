@@ -62,24 +62,31 @@ In your terminal, from inside your repo:
 ```bash
 agent pull                 # fetch the agent's branches (as agent/<task>); your files are untouched
 agent review uart-fix      # summary + commits, then VS Code with every change shown as staged
-agent merge uart-fix       # real git merge; conflicts open in VS Code's merge editor
-git push                   # you push, from your account
+agent merge uart-fix       # the agent's changes appear in your repo as staged files
 ```
 
-**Small fixes yourself.** A rename or a tweak doesn't need another round with the agent. Use:
+Then commit in VS Code (or `git commit`) and `git push`, from your account.
 
-```bash
-agent merge uart-fix --edit
-```
+**It works like HermesSync's sync.** The agent only changes files; you take them into your repo as your own work:
+- `agent merge` stages the agent's changes. It doesn't commit, and it doesn't bring the agent's commits into your history.
+- You check them in VS Code, fix anything you like (a rename doesn't need another round with the agent), then commit.
+- The commit message is pre-filled from the agent's commit titles, with any co-author lines removed. On GitHub it's a normal commit by you: no agent commits, no Claude co-author.
+- Conflicts open in VS Code under **Merge Changes**.
+- `git reset --merge` undoes the whole thing.
 
-This starts the merge without committing. The agent's changes are staged in your repo; make your fixes in VS Code, then `git commit`. `git merge --abort` undoes it all.
+Options:
+- `agent merge <task> --commit` stages and commits in one go, with the pre-filled message.
+- `agent merge <task> --merge` does a real git merge instead, if you ever want the agent's own commits in your history.
 
-You can also edit the review copy that `agent review` opens. Your edits are never thrown away:
-- `agent merge` (with or without `--edit`) applies them in your repo.
+**After you've taken a task.** Once you commit, the task shows as `merged` in `agent pull`. If you give the agent follow-up work on the same task:
+- it continues from your latest commit, so nothing is offered twice;
+- `agent pull` shows only what's new since your last merge, and `agent review` shows only that;
+- `agent merge` takes only that.
+
+**Editing the review copy.** You can also edit the copy that `agent review` opens. Your edits are never thrown away:
+- `agent merge` brings them into your repo along with the agent's changes.
 - Running `agent review` again carries them into the fresh copy.
 - `agent review <task> --close` saves them as a patch and tells you where.
-
-`--squash` stages the whole task as one change instead of a merge.
 
 `agent push --wip` sends your uncommitted tracked changes too; the agent sees them as `desktop-wip/<branch>`. Other commands:
 - `agent list` and `agent doctor` show what's shared and whether everything is healthy.
