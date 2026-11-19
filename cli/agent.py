@@ -11,6 +11,7 @@ install.sh has set them up; otherwise it falls back to plain text.
 from __future__ import annotations
 
 import argparse
+import difflib
 import fcntl
 import json
 import os
@@ -894,7 +895,7 @@ def cmd_unshare(a) -> None:
     if pending:
         warn(f"unmerged agent branches will be lost: {', '.join(pending)}")
     if not a.yes:
-        if input(f"Type {name} to confirm: ").strip() != name:
+        if ask(f"Type {name} to confirm") != name:
             say("Cancelled.", "muted")
             return
     if src.is_dir():
@@ -1716,6 +1717,181 @@ def cmd_completion(a) -> None:
     hint("Open a new terminal (or run: exec " + shell + "), then try", "agent review <Tab><Tab>")
 
 
+# ---------------------------------------------------------------- update
+# The install folder is a git clone. `agent update` fast-forwards it (or, for a
+# shallow clone made with --depth 1, replaces it with the new tip and drops the
+# old objects, so only the current version is kept), then re-runs install.sh.
+# The image is rebuilt only when container/ changed or Claude Code is upgraded.
+
+def latest_claude_code() -> str:
+    """The newest Claude Code on npm, asked through the image's own npm (no npm needed here)."""
+    if not shutil.which("docker"):
+        return ""
+    p = run(["docker", "run", "--rm", "--entrypoint", "npm", IMAGE, "view", "@anthropic-ai/claude-code", "version"],
+            check=False)
+    m = re.search(r"\d+\.\d+\.\d+", p.stdout or "")
+    return m.group(0) if m else ""
+
+
+def cmd_update(a) -> None:
+    if not (REPO / ".git").exists():
+        raise Fail(f"{REPO} isn't a git clone, so it can't update itself. Re-install with:\n"
+                   f"git clone --depth 1 <repo url> {REPO} && {REPO}/install.sh")
+    heading("Update agent")
+    branch = git(REPO, "symbolic-ref", "-q", "--short", "HEAD", check=False).stdout.strip()
+    upstream = git(REPO, "rev-parse", "--abbrev-ref", "@{u}", check=False).stdout.strip()
+    if not upstream:
+        if not branch:
+            raise Fail(f"{REPO} is on a detached HEAD; check out a branch first")
+        upstream = f"origin/{branch}"
+    remote, _, rbranch = upstream.partition("/")
+    shallow = out(REPO, "rev-parse", "--is-shallow-repository") == "true"
+    with status(f"checking {remote} for updates …"):
+        git(REPO, "fetch", "--quiet", *(["--depth", "1"] if shallow else []), remote, rbranch)
+        latest = latest_claude_code() if a.claude or a.check else ""
+    old, new = out(REPO, "rev-parse", "HEAD"), out(REPO, "rev-parse", "FETCH_HEAD")
+    info = json.loads(machine_file().read_text()) if machine_file().exists() else {}
+    pinned = info.get("claude_code", "")
+    changed = out(REPO, "diff", "--name-only", old, new).splitlines() if old != new else []
+    rebuild = any(f.startswith("container/") for f in changed)
+
+    kv([["Install folder", (tilde(REPO) + ("  (shallow copy)" if shallow else ""), "path")],
+        ["Installed", (f"{old[:9]}  {out(REPO, 'log', '-1', '--format=%s', old)}", "")],
+        ["Available", (f"{new[:9]}  {out(REPO, 'log', '-1', '--format=%s', new)}", "ok") if old != new
+         else ("up to date", "ok")],
+        ["Claude Code", (pinned or "?") + (f"  →  {latest} available" if latest and latest != pinned else
+                                         "  (newest)" if latest else "")]])
+    if old != new and not shallow:
+        log = sanitize(out(REPO, "log", "--oneline", "--no-decorate", f"{old}..{new}"))
+        if log:
+            table(["Commit", "What's new"], [line.split(" ", 1) + [""] * (1 - line.count(" "))
+                                              for line in log.splitlines()[:15]], ["sha", ""])
+    if changed:
+        note(f"{len(changed)} file(s) change" + ("; the image will be rebuilt" if rebuild else
+                                                 "; the image stays as it is"))
+    if a.check:
+        if old != new or (latest and latest != pinned):
+            hint("Update", "agent update" + (" --claude" if latest and latest != pinned else ""))
+        return
+    if old == new and not a.claude and not a.reinstall:
+        ok("already up to date")
+        return
+    if old != new:
+        if out(REPO, "status", "--porcelain", "--untracked-files=no"):
+            raise Fail(f"{REPO} has local changes. Commit or stash them, then update")
+        if shallow:
+            git(REPO, "reset", "--quiet", "--hard", new)
+            # Keep only the new version: drop the old commit and its files.
+            git(REPO, "reflog", "expire", "--expire=now", "--all", check=False)
+            git(REPO, "gc", "--quiet", "--prune=now", check=False)
+        elif git(REPO, "merge", "--quiet", "--ff-only", new, check=False).returncode:
+            raise Fail(f"{REPO} has commits that aren't on {upstream}; update it by hand (git pull)")
+        ok(f"updated to {new[:9]}")
+    if a.no_install:
+        hint("Finish later", f"{REPO}/install.sh")
+        return
+    args = [str(REPO / "install.sh")]
+    if a.claude:
+        args += ["--claude-version", "latest"]
+    elif not rebuild:
+        args.append("--no-build")  # nothing in the image changed
+    if container_running() and (a.claude or rebuild):
+        note("The container restarts with the new image; running sessions reconnect on their own.")
+    close_box()
+    os.execvp("bash", ["bash", *args])
+
+
+# ---------------------------------------------------------------- help
+# argparse's help and errors, drawn in the same boxes as everything else.
+
+COMMAND_GROUPS = (
+    ("Daily", ("pull", "review", "merge", "push")),
+    ("Repos", ("share", "unshare", "list")),
+    ("Container", ("up", "down", "restart", "logs", "attach", "shell", "login")),
+    ("This machine", ("setup", "update", "doctor", "storage", "completion")),
+)
+
+
+def _backticks(text: str) -> Text:
+    """Plain text with `command` spans highlighted."""
+    t = Text()
+    for i, part in enumerate(re.split(r"`([^`]+)`", text)):
+        t.append(part, "cmd" if i % 2 else "")
+    return t
+
+
+class AgentParser(argparse.ArgumentParser):
+    def print_help(self, file=None):
+        if OUT is None:
+            return super().print_help(file)
+        render_help(self)
+
+    def error(self, message):
+        m = re.search(r"invalid choice: '([^']*)'", message)
+        if m:
+            subs = [x for x in self._actions if isinstance(x, argparse._SubParsersAction)]
+            names = [c.dest for c in subs[0]._choices_actions] if subs else []
+            close = difflib.get_close_matches(m.group(1), names, n=2)
+            message = f"unknown command '{m.group(1)}'" + (f". Did you mean: {' or '.join(close)}?" if close else "")
+        if OUT is None:
+            return super().error(message)
+        error(message)
+        hint("Help", f"{self.prog} --help")
+        sys.exit(2)
+
+
+def render_help(p: argparse.ArgumentParser) -> None:
+    fmt = p._get_formatter()
+    if p.prog == "agent":
+        banner([("agent", "bold"), (p.description or "", "muted"), ("", "")])
+    heading(p.prog)
+    if p.description and p.prog != "agent":
+        emit(Text(p.description))
+    usage = re.sub(r"(?i)^usage:\s*", "", p.format_usage().strip())
+    emit(Text.assemble(("Usage  ", "muted"), (usage, "bold")))
+
+    def rows(actions):
+        g = Table.grid(padding=(0, 2))
+        g.add_column(no_wrap=True)
+        g.add_column(style="muted", overflow="fold")
+        for act in actions:
+            inv = fmt._format_action_invocation(act)
+            flag, _, meta = inv.partition(" ") if act.option_strings and act.nargs != 0 else (inv, "", "")
+            g.add_row(Text.assemble(("  " + flag, "name"), (" " + meta if meta else "", "sha")),
+                      Text(fmt._expand_help(act) if act.help else ""))
+        return g
+
+    subs = [x for x in p._actions if isinstance(x, argparse._SubParsersAction)]
+    if subs:
+        choices = {c.dest: c for c in subs[0]._choices_actions}
+        groups = COMMAND_GROUPS if p.prog == "agent" else (("Commands", tuple(choices)),)
+        listed = set()
+        for title, names in groups:
+            acts = [choices[n] for n in names if n in choices]
+            if acts:
+                subheading(title)
+                emit(rows(acts))
+                listed.update(names)
+        rest = [c for n, c in choices.items() if n not in listed]
+        if rest:
+            subheading("More")
+            emit(rows(rest))
+    pos = [x for x in p._actions if not x.option_strings and not isinstance(x, argparse._SubParsersAction)
+           and x.help != argparse.SUPPRESS]
+    if pos:
+        subheading("Arguments")
+        emit(rows(pos))
+    opts = [x for x in p._actions if x.option_strings and x.help != argparse.SUPPRESS]
+    if opts:
+        subheading("Options")
+        emit(rows(opts))
+    if p.epilog:
+        emit(Text(""))
+        for line in p.epilog.rstrip().splitlines():
+            emit(_backticks(line))
+    close_box()
+
+
 # ---------------------------------------------------------------- main
 
 EPILOG = """\
@@ -1724,13 +1900,13 @@ Typical day:
   `agent review <task>`    read its handoff, open the changes in VS Code
   `agent merge <task>`     take the changes into your repo, staged
 
-Disk space: `agent storage`.  Tab completion: `agent completion install`.
+Disk space: `agent storage`.  Tab completion: `agent completion install`.  New version: `agent update`.
 """
 
 
 def build_parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(prog="agent", description="Host CLI for the Claude Code agent container.",
-                                 epilog=EPILOG, formatter_class=HELP_FORMAT)
+    ap = AgentParser(prog="agent", description="Host CLI for the Claude Code agent container.",
+                     epilog=EPILOG, formatter_class=HELP_FORMAT)
     ap._positionals.title = "Commands"
     sub = ap.add_subparsers(dest="cmd", metavar="COMMAND")
     add_parser = sub.add_parser
@@ -1755,8 +1931,15 @@ def build_parser() -> argparse.ArgumentParser:
                            ("list", cmd_list, "list shared repos")):
         sub.add_parser(cmd, help=help_).set_defaults(fn=fn)
 
+    s = sub.add_parser("update", help="update this tool (and optionally Claude Code), rebuilding only what changed")
+    s.add_argument("--check", action="store_true", help="only show what's new")
+    s.add_argument("--claude", action="store_true", help="also upgrade Claude Code in the image to the newest")
+    s.add_argument("--reinstall", action="store_true", help="re-run install.sh even if nothing changed")
+    s.add_argument("--no-install", action="store_true", help="update the files only; run install.sh yourself later")
+    s.set_defaults(fn=cmd_update)
+
     s = sub.add_parser("share", help="give the agent a repo (dry run unless --yes)")
-    s.add_argument("path", nargs="?", default=".")
+    s.add_argument("path", nargs="?", default=".", help="the repo to share (default: the one you're in)")
     s.add_argument("--name", help="project name (default: folder name)")
     s.add_argument("--yes", action="store_true", help="actually share")
     s.add_argument("--no-hooks", action="store_true", help="don't install auto-push hooks")
@@ -1764,21 +1947,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("push", help="send your commits to the agent (runs automatically after commits)")
     s.add_argument("--wip", action="store_true", help="also send uncommitted tracked changes")
-    s.add_argument("--quiet", action="store_true")
+    s.add_argument("--quiet", action="store_true", help="print nothing (used by the auto-push hooks)")
     s.set_defaults(fn=cmd_push)
 
     s = sub.add_parser("pull", help="fetch the agent's branches into your repo")
     s.set_defaults(fn=cmd_pull)
 
     s = sub.add_parser("review", help="show a task's handoff and open its changes in VS Code")
-    s.add_argument("task")
+    s.add_argument("task", help="the task name, e.g. uart-fix (Tab completes it)")
     s.add_argument("--base", default="HEAD", help="compare against this ref (default: your HEAD)")
     s.add_argument("--no-open", action="store_true", help="don't open VS Code")
     s.add_argument("--close", action="store_true", help="remove the review copy")
     s.set_defaults(fn=cmd_review)
 
     s = sub.add_parser("merge", help="take a task's changes into your repo as your own (staged, not committed)")
-    s.add_argument("task")
+    s.add_argument("task", help="the task name, e.g. uart-fix (Tab completes it)")
     mode = s.add_mutually_exclusive_group()
     mode.add_argument("--commit", action="store_true",
                       help="also commit them as you, with the pre-filled message")
@@ -1789,7 +1972,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(fn=cmd_merge)
 
     s = sub.add_parser("unshare", help="stop sharing a repo and delete the agent's copy")
-    s.add_argument("--yes", action="store_true")
+    s.add_argument("--yes", action="store_true", help="don't ask for confirmation")
     s.set_defaults(fn=cmd_unshare)
 
     for name in ("push", "pull", "review", "merge", "unshare"):
@@ -1805,11 +1988,11 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--yes", action="store_true", help="don't ask")
     c.set_defaults(fn=cmd_storage_clean)
     c = st.add_parser("move", help="move the agent's data to another folder or disk")
-    c.add_argument("target", metavar="PATH")
+    c.add_argument("target", metavar="PATH", help="new folder, e.g. /data/Agent (must be empty or missing)")
     c.add_argument("--yes", action="store_true", help="don't ask")
     c.set_defaults(fn=lambda a: cmd_storage_move(argparse.Namespace(path=a.target, yes=a.yes)))
     c = st.add_parser("docker-move", help="show the commands to move Docker's own data to another disk")
-    c.add_argument("target", metavar="PATH")
+    c.add_argument("target", metavar="PATH", help="new folder for Docker's data, e.g. /data/docker")
     c.set_defaults(fn=lambda a: cmd_docker_move(argparse.Namespace(path=a.target)))
 
     s = sub.add_parser("completion", help="shell tab completion: install it, or print the script")
@@ -1837,7 +2020,8 @@ def welcome() -> None:
     heading("Commands")
     for cmd, what in (("agent pull", "see what the agent did"), ("agent review <task>", "handoff + changes in VS Code"),
                       ("agent merge <task>", "take the changes, staged"), ("agent share PATH --yes", "give it a repo"),
-                      ("agent storage", "disk space"), ("agent doctor", "health check"), ("agent --help", "everything")):
+                      ("agent storage", "disk space"), ("agent doctor", "health check"),
+                      ("agent update", "get the newest version"), ("agent --help", "everything")):
         emit(Text.assemble(("  " + cmd.ljust(24), "cmd"), (what, "muted")))
     close_box()
 

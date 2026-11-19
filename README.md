@@ -15,9 +15,8 @@ Your repo ◀──agent pull (fetches agent/* only)─────────�
 Needs Linux (or macOS) with Docker Engine + Compose, git, and Python 3.9+. Your user must be able to run `docker` without sudo.
 
 ```bash
-git clone <this repo> ~/agent-setup
-cd ~/agent-setup
-./install.sh
+git clone --depth 1 <this repo> ~/.local/share/agent/src
+~/.local/share/agent/src/install.sh
 agent login
 ```
 
@@ -28,7 +27,24 @@ agent login
 - builds the image, pinning the Claude Code version it installed;
 - starts the container.
 
-`agent login` signs the container in to your Claude subscription, once per machine. Re-run `./install.sh` any time to update. It keeps your login, vault, and shared repos.
+`agent login` signs the container in to your Claude subscription, once per machine.
+
+`--depth 1` keeps only the current version of this repo (a few hundred KB), not its history. Any clone works, though; a full one is fine if you develop the agent itself.
+
+## Update
+
+```bash
+agent update --check     # what's new, and whether a newer Claude Code exists
+agent update             # get it
+agent update --claude    # also upgrade Claude Code inside the image
+```
+
+`agent update`:
+- **Updates the install folder.** For a `--depth 1` clone it replaces the folder with the new version and deletes the old one, so only one version is ever kept. For a full clone it fast-forwards. It stops if you have local changes there.
+- **Re-runs `install.sh`.** That refreshes the CLI's Python packages, the agent's Claude config and skills, and tab completion.
+- **Rebuilds only what changed.** The image is rebuilt only when `container/` changed or you pass `--claude`, and the previous image is removed.
+
+Your login, vault and shared repos are kept.
 
 ## Share a repo
 
