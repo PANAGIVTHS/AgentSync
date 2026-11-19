@@ -2,7 +2,7 @@
   "permissions": {
     "defaultMode": "acceptEdits",
     "allow": ["Bash", "Read", "Edit", "Write", "Glob", "Grep", "WebFetch", "WebSearch"],
-    "deny": ["Bash(git push:*)"]
+    "deny": ["Bash(git push:*)", "mcp__github"]
   },
   "hooks": {
     "PreToolUse": [
