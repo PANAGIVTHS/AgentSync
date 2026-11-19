@@ -13,7 +13,9 @@ You run in a Docker container. The user talks to you from the Claude Code web UI
 - At handoff, save what will still be true later (see the vault skill). Fix or delete a note as soon as you find it wrong. Never store secrets.
 
 ## Token economy
-- Search before reading: `rg`, Glob, ranged reads. Don't read whole trees.
-- Send long command output to a file under /tmp and read only the part you need.
+- Search before reading: `rg`, Glob, ranged reads. Don't read whole files unless you need all of them.
+- Run builds, test suites and anything that may print more than ~30 lines as `quiet <cmd>` (or `quiet 'a && b'`). It keeps the full log and prints status, summary, first distinct errors and the tail. Dig further with `rg -n PATTERN <log>` or a ranged read, never by printing the whole log.
+- Broad questions across many files (where is X handled, what uses Y): ask the Explore subagent and keep only its conclusion. For a known file or symbol, search yourself.
+- First time building or testing a repo: `vault find <project> build test`. If there's no note, save one once tests run (commands, setup, gotchas).
 - Write scripts for repeated multi-step work instead of repeating tool calls.
 - Keep replies short: what changed, how it was verified, what is left.

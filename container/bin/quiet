@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""quiet: run a noisy command, keep its full log, print only what matters.
+
+  quiet [-n TAIL] [-e ERRORS] [--name NAME] -- CMD ARGS…
+  quiet 'cd build && make -j8'          # one argument: run with bash -c
+
+Prints the exit status, run time, the log's path and size, summary lines
+(e.g. "45 passed, 2 failed"), the first distinct error lines (Verilator
+%Error, $fatal, assertions, tracebacks, compiler errors …) with their line
+numbers, and the last lines. Dig further with: rg -n PATTERN LOG, or a ranged read.
+Exits with the command's own status. Logs older than 3 days are removed.
+"""
+import argparse
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+LOG_DIR = Path(os.environ.get("QUIET_LOG_DIR", "/tmp/agent-logs"))
+MAX_LINE = 240
+SHORT = 30  # outputs this short are printed as they are
+ERROR = re.compile(
+    r"%Error|%Warning-[A-Z]|\$fatal|\bASSERT(ION)?\b|Assertion .* failed|\bassert(ion)? (failed|error)"
+    r"|\b(error|fatal|panic|exception|segmentation fault|core dumped|undefined reference|traceback)\b"
+    r"|\bFAIL(ED|URE)?\b|\bfailed\b|^E\s{2,}|^\s*\^~*\s*$|: \*\*\* ",
+    re.I)
+NOT_ERROR = re.compile(r"\b0 (errors?|failed|failures|fatal)\b|\b(no|without) errors?\b|-W?error\b|xfail", re.I)
+SUMMARY = re.compile(
+    r"\b\d+ (passed|failed|errors?|failures?|skipped|tests?|cases?|warnings?)\b|^(OK|FAILED)\b|\bRan \d+ tests?"
+    r"|\b(tests?|cases?|suites?) (passed|failed)\b|^(PASS|FAIL)\b|\bTOTAL\b|\b\d+/\d+ (passed|tests?)",
+    re.I)
+
+
+def clip(line: str) -> str:
+    line = line.rstrip("\n")
+    return line if len(line) <= MAX_LINE else line[:MAX_LINE] + " …"
+
+
+def prune_old() -> None:
+    cutoff = time.time() - 3 * 86400
+    for f in LOG_DIR.glob("*.log"):
+        try:
+            if f.stat().st_mtime < cutoff:
+                f.unlink()
+        except OSError:
+            pass
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="quiet", description=__doc__.split("\n\n")[0])
+    ap.add_argument("-n", "--tail", type=int, default=25, help="last lines to show (default 25; 10 on success)")
+    ap.add_argument("-e", "--errors", type=int, default=20, help="distinct error lines to show (default 20)")
+    ap.add_argument("--name", help="log file name prefix (default: the command)")
+    ap.add_argument("cmd", nargs=argparse.REMAINDER)
+    a = ap.parse_args()
+    cmd = a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd
+    if not cmd:
+        ap.error("no command given")
+    shell = len(cmd) == 1 and re.search(r"[\s;&|<>$`]", cmd[0])
+    argv = ["bash", "-c", cmd[0]] if shell else cmd
+    shown = cmd[0] if shell else " ".join(cmd)
+
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    prune_old()
+    stem = re.sub(r"[^A-Za-z0-9_.-]+", "-", a.name or Path(shown.split()[0]).name).strip("-")[:40] or "cmd"
+    log = LOG_DIR / f"{stem}-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}.log"
+
+    start = time.time()
+    lines = 0
+    errors: dict[str, list] = {}  # normalized message -> [first line number, text, count]
+    summary: list[str] = []
+    tail: list[str] = []
+    with open(log, "w", errors="replace") as out:
+        try:
+            p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                 errors="replace", bufsize=1)
+        except OSError as e:
+            print(f"quiet: cannot run {shown}: {e}", file=sys.stderr)
+            return 127
+        for raw in p.stdout:
+            out.write(raw)
+            lines += 1
+            line = clip(raw)
+            tail.append(line)
+            if len(tail) > max(a.tail, SHORT):
+                tail.pop(0)
+            if SUMMARY.search(line):
+                summary.append(line)
+                summary = summary[-6:]
+            if ERROR.search(line) and not NOT_ERROR.search(line):
+                key = re.sub(r"\d+", "N", line.strip())  # same message at different places counts once
+                if key in errors:
+                    errors[key][2] += 1
+                elif len(errors) < 500:
+                    errors[key] = [lines, line.strip(), 1]
+        code = p.wait()
+
+    took = time.time() - start
+    mins, secs = divmod(int(took), 60)
+    status = "ok" if code == 0 else f"exit {code}"
+    print(f"$ {shown}")
+    print(f"{status} · {f'{mins}m{secs:02d}s' if mins else f'{took:.1f}s'} · {lines} lines · log: {log}")
+    if lines <= SHORT:  # short output: just show it
+        for t in tail[-lines:] if lines else []:
+            print(f"  {t}")
+        return code
+    if summary:
+        print("summary:")
+        for s in summary:
+            print(f"  {s.strip()}")
+    found = list(errors.values())
+    limit = a.errors if code else min(a.errors, 5)
+    if found and limit:
+        print(f"errors ({min(len(found), limit)} of {len(found)} distinct):")
+        for lineno, text, count in found[:limit]:
+            print(f"  {lineno}: {text}" + (f"  (×{count})" if count > 1 else ""))
+    n = a.tail if code else min(a.tail, 10)
+    if tail and n:
+        print(f"tail ({min(n, len(tail))} lines):")
+        for t in tail[-n:]:
+            print(f"  {t}")
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

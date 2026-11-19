@@ -137,13 +137,19 @@ This setup is designed to cost about the same as using Claude Code normally:
 
 | Added | Cost |
 |---|---|
-| `~/.claude/CLAUDE.md` | About 450 tokens, once per session, cached after |
+| `~/.claude/CLAUDE.md` | About 650 tokens, once per session, cached after |
 | 4 skills | Only their one-line descriptions load until used |
 | Push guard hook | 0 (a script; prints only when it blocks a push) |
 | Vault hint hook | 0 unless a note strongly matches the prompt |
 | Remote Control | 0 |
 
 There are no background agents, no automatic tidy passes, and no hooks that make Claude take extra turns.
+
+What keeps sessions cheap:
+- **`quiet`.** Builds and test runs go through `quiet <cmd>`. It keeps the full log in `/tmp/agent-logs` and shows the agent only the status, the summary ("45 passed, 2 failed"), the first distinct errors with line numbers (Verilator `%Error`, `$fatal`, assertions, tracebacks, compiler errors) and the tail. A 50,000-line simulation log costs about 40 lines.
+- **Explore first.** Broad searches go to a read-only search subagent. Only its conclusion enters the chat, not the files it read.
+- **Notes per repo.** The first time the agent gets a repo's tests running, it saves how, so later sessions don't work it out again.
+- **New chats for new work.** A long chat re-reads all of its history on every turn. After `/handoff`, start a new chat for unrelated work; the vault and the handoff carry the context.
 
 ## Safety model
 
@@ -168,7 +174,7 @@ Add Debian packages to `container/packages.txt`, then run `./install.sh`. Tools 
 cli/agent.py              host CLI (Claude-themed Rich output when available, plain otherwise)
 requirements.txt          Rich + rich-argparse for the CLI's venv
 container/                Dockerfile, compose, packages.txt, gitconfig
-container/bin/            in-container tools: agent-task, vault, agent-guard, agent-supervisor
+container/bin/            in-container tools: agent-task, vault, quiet, agent-guard, agent-supervisor
 container/githooks/       pre-commit: commits only on agent/* branches
 claude/                   CLAUDE.md, settings.json (hooks), skills: task, handoff, status, vault
 vault-template/           starting vault
