@@ -23,15 +23,45 @@ import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-AGENT_HOME = Path(os.environ.get("AGENT_HOME", str(Path.home() / "Agent"))).expanduser()
+CONFIG_FILE = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "agent" / "config.json"
+DATA_DIR = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
 IMAGE = os.environ.get("AGENT_IMAGE", "agent-runtime:local")
 CONTAINER = "agent"
+ENTRYPOINT = "/opt/agent/bin/agent-supervisor"  # identifies our images, including old untagged ones
 NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,62}\Z")
 HOOK_BEGIN = "# >>> agent auto-push >>>"
 HOOK_END = "# <<< agent auto-push <<<"
 HOOK_NAMES = ("post-commit", "post-merge", "post-rewrite")
 NO_PUSH = "no-push://disabled"
 CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f\x9b]")
+GB = 1024 ** 3
+LOW_FREE = 5 * GB     # warn below this much free space
+BUILD_NEEDS = 3 * GB  # roughly what a fresh image build takes on Docker's disk
+
+
+def load_config() -> dict:
+    try:
+        return json.loads(CONFIG_FILE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_config(**changes) -> None:
+    cfg = {**load_config(), **changes}
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(cfg, indent=2, sort_keys=True) + "\n")
+
+
+def configured_home() -> Path:
+    """AGENT_HOME, else the location chosen at setup (config.json), else ~/Agent."""
+    if os.environ.get("AGENT_HOME"):
+        return Path(os.environ["AGENT_HOME"]).expanduser()
+    if load_config().get("home"):
+        return Path(load_config()["home"]).expanduser()
+    return Path.home() / "Agent"
+
+
+AGENT_HOME = configured_home()
 
 
 class Fail(Exception):
@@ -44,24 +74,32 @@ class Fail(Exception):
 # so brackets in branch names or agent-written text print literally.
 
 try:
-    if os.environ.get("AGENT_PLAIN") == "1":
+    if os.environ.get("AGENT_PLAIN") == "1" or sys.argv[1:2] == ["__complete"]:
         raise ImportError
     from rich import box
     from rich.console import Console
     from rich.panel import Panel
     from rich.table import Table
     from rich.text import Text
-    OUT = Console(highlight=False, soft_wrap=True)
-    ERR = Console(stderr=True, highlight=False, soft_wrap=True)
+    from rich.theme import Theme
+    THEME = Theme({"ok": "bold green", "warn": "bold yellow", "bad": "bold red", "head": "bold cyan",
+                   "muted": "dim", "name": "bold green", "path": "cyan", "sha": "yellow", "cmd": "bold magenta"})
+    OUT = Console(highlight=False, soft_wrap=True, theme=THEME)
+    ERR = Console(stderr=True, highlight=False, soft_wrap=True, theme=THEME)
 except ImportError:
     OUT = ERR = None
 
 try:
     if OUT is None:
         raise ImportError
-    from rich_argparse import RichHelpFormatter as HELP_FORMAT
+    from rich_argparse import RawDescriptionRichHelpFormatter as RichHelpFormatter
+
+    class HELP_FORMAT(RichHelpFormatter):
+        styles = {**RichHelpFormatter.styles, "argparse.groups": "bold cyan", "argparse.args": "green",
+                  "argparse.metavar": "yellow", "argparse.prog": "bold magenta", "argparse.syntax": "bold"}
+        highlights = [*RichHelpFormatter.highlights, r"(?P<syntax>`[^`]+`)"]
 except ImportError:
-    HELP_FORMAT = argparse.HelpFormatter
+    HELP_FORMAT = argparse.RawDescriptionHelpFormatter
 
 
 def _say(console, plain_prefix: str, rich_prefix: tuple[str, str], msg: str, style: str = "", err=False) -> None:
@@ -72,40 +110,71 @@ def _say(console, plain_prefix: str, rich_prefix: tuple[str, str], msg: str, sty
 
 
 def ok(msg: str) -> None:
-    _say(OUT, "✓ ", ("✓ ", "bold green"), msg)
+    _say(OUT, "✓ ", ("✓ ", "ok"), msg)
 
 
 def note(msg: str) -> None:
-    _say(OUT, "  ", ("  ", ""), msg, "dim")
+    _say(OUT, "  ", ("  ", ""), msg, "muted")
+
+
+def bullet(sign: str, msg: str, style: str = "ok") -> None:
+    """A '+ thing' line in a plan; the sign is coloured."""
+    _say(OUT, f"  {sign} ", (f"  {sign} ", style), msg)
+
+
+def hint(label: str, command: str) -> None:
+    """'  label: command', with the command highlighted."""
+    if OUT is None:
+        print(f"  {label}: {command}")
+    else:
+        OUT.print(Text.assemble(("  " + label + ": ", "muted"), (command, "cmd")))
 
 
 def warn(msg: str) -> None:
-    _say(ERR, "! ", ("! ", "bold yellow"), msg, err=True)
+    _say(ERR, "! ", ("! ", "warn"), msg, err=True)
 
 
 def error(msg: str) -> None:
-    _say(ERR, "✗ ", ("✗ ", "bold red"), msg, err=True)
+    _say(ERR, "✗ ", ("✗ ", "bad"), msg, err=True)
 
 
 def heading(msg: str) -> None:
     if OUT is None:
         print(msg)
     else:
-        OUT.print(Text(msg, style="bold cyan"))
+        OUT.print()
+        OUT.print(Text.assemble(("▌ ", "cyan"), (msg, "head")))
 
 
-def table(columns: list[str], rows: list[list[str]], styles: list[str] | None = None) -> None:
-    """A borderless table; plain mode aligns columns with spaces."""
+def table(columns: list[str], rows: list[list], styles: list[str] | None = None) -> None:
+    """A borderless table; plain mode aligns columns with spaces. Cells may be (text, style) pairs."""
+    cell = lambda c: c if isinstance(c, tuple) else (str(c), "")
     if OUT is None:
-        widths = [max(len(str(r[i])) for r in [columns, *rows]) for i in range(len(columns))]
-        for r in [columns, *rows]:
+        rows_ = [[cell(c)[0] for c in r] for r in rows]
+        widths = [max(len(r[i]) for r in [columns, *rows_]) for i in range(len(columns))]
+        for r in [columns, *rows_]:
             print("  " + "  ".join(str(c).ljust(w) for c, w in zip(r, widths)).rstrip())
         return
-    t = Table(box=box.SIMPLE_HEAD, show_edge=False, header_style="bold", pad_edge=False)
+    t = Table(box=box.SIMPLE_HEAD, show_edge=False, header_style="bold", pad_edge=False, border_style="dim")
     for i, c in enumerate(columns):
         t.add_column(c, style=(styles or [""] * len(columns))[i], overflow="fold")
     for r in rows:
-        t.add_row(*[Text(str(c)) for c in r])
+        t.add_row(*[Text(*cell(c)) for c in r])
+    OUT.print(t)
+
+
+def kv(rows: list[list]) -> None:
+    """Label/value lines with no header."""
+    if OUT is None:
+        w = max(len(r[0]) for r in rows)
+        for label, value in rows:
+            print(f"  {label.ljust(w)}   {value[0] if isinstance(value, tuple) else value}")
+        return
+    t = Table.grid(padding=(0, 3))
+    t.add_column(style="muted")
+    t.add_column()
+    for label, value in rows:
+        t.add_row(Text(label), Text(*(value if isinstance(value, tuple) else (str(value), ""))))
     OUT.print(t)
 
 
@@ -113,7 +182,49 @@ def panel(text: str, title: str) -> None:
     if OUT is None:
         print(f"── {title} ──\n{text}\n")
     else:
-        OUT.print(Panel(Text(text), title=title, title_align="left", border_style="dim", expand=False))
+        OUT.print(Panel(Text(text), title=Text(title, "head"), title_align="left", border_style="cyan",
+                        expand=False, padding=(0, 1)))
+
+
+class status:
+    """A spinner while something slow runs (Rich only)."""
+
+    def __init__(self, msg: str):
+        self.s = OUT.status(Text(msg), spinner="dots") if OUT is not None and OUT.is_terminal else None
+
+    def __enter__(self):
+        if self.s:
+            self.s.__enter__()
+
+    def __exit__(self, *exc):
+        if self.s:
+            self.s.__exit__(*exc)
+
+
+def interactive() -> bool:
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def ask(question: str, default: str = "") -> str:
+    shown = f" [{default}]" if default else ""
+    if OUT is None:
+        answer = input(f"{question}{shown}: ")
+    else:
+        answer = OUT.input(Text.assemble(("? ", "head"), (question, "bold"), (shown, "muted"), ": "))
+    return answer.strip() or default
+
+
+def confirm(question: str, default: bool = False) -> bool:
+    answer = ask(question + (" (Y/n)" if default else " (y/N)")).lower()
+    return default if not answer else answer in ("y", "yes")
+
+
+def human(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(n) < 1024 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit in ("B", "KB") else f"{n:.1f} {unit}"
+        n /= 1024
+    return ""
 
 
 def sanitize(text: str) -> str:
@@ -320,19 +431,20 @@ def cmd_share(a) -> None:
     hooks_ok = not a.no_hooks and hooks_dir(src) is not None
 
     heading(f"Share {name}")
-    note(f"Your repo:    {src}")
-    note(f"Branches:     {len(branches)} (default {default}); committed history only")
-    note(f"Agent clone:  /work/{name} in the container")
+    kv([["Your repo", (str(src), "path")],
+                     ["Branches", f"{len(branches)} (default {default}); committed history only"],
+                     ["Agent clone", (f"/work/{name} in the container", "path")],
+                     ["Stored in", (str(AGENT_HOME), "path")]])
     heading("Changes to your repo")
-    note("+ remote 'agent' (fetch only; pushing to it is disabled)")
+    bullet("+", "remote 'agent' (fetch only; pushing to it is disabled)")
     if hooks_ok:
-        note("+ hooks post-commit, post-merge, post-rewrite: auto-send your commits")
+        bullet("+", "hooks post-commit, post-merge, post-rewrite: auto-send your commits")
     elif a.no_hooks:
-        note("  no hooks (--no-hooks): run `agent push` after you commit")
+        bullet("-", "no hooks (--no-hooks): run `agent push` after you commit", "warn")
     else:
-        note("  no hooks (core.hooksPath is set): run `agent push` after you commit")
+        bullet("-", "no hooks (core.hooksPath is set): run `agent push` after you commit", "warn")
     if not a.yes:
-        print("Dry run. Re-run with --yes to share.")
+        _say(OUT, "", ("\n", ""), "Dry run. Re-run with --yes to share.", "warn")
         return
 
     for d in dirs().values():
@@ -480,10 +592,14 @@ def cmd_pull(a) -> None:
         ref = f"refs/remotes/agent/{task}"
         subject = sanitize(out(src, "log", "-1", "--format=%s", ref))[:60]
         ready = "written" if handoff_of(name, task).exists() else "-"
-        rows.append([f"agent/{task}", task_state(src, name, task), ready, subject])
+        state = task_state(src, name, task)
+        style = "muted" if state == "merged" else "magenta" if state.startswith("staged") else "warn"
+        rows.append([f"agent/{task}", (state, style), ("✓ written" if ready == "written" else "-",
+                                                       "ok" if ready == "written" else "muted"), subject])
     heading(f"Agent branches in {name}")
-    table(["Branch", "Commits", "Handoff", "Last commit"], rows, ["bold green", "", "", "dim"])
-    note("Review: agent review <task>    Take the changes: agent merge <task>")
+    table(["Branch", "Commits", "Handoff", "Last commit"], rows, ["name", "", "", "muted"])
+    hint("Review", "agent review <task>")
+    hint("Take the changes", "agent merge <task>")
 
 
 # ---------------------------------------------------------------- review copies
@@ -558,9 +674,14 @@ def cmd_review(a) -> None:
         table(["Commit", "Message"], rows, ["yellow", ""])
     else:
         note("(no commits)")
-    stat = out(src, "diff", "--stat", base, ref).splitlines()
-    if stat:
-        note(stat[-1].strip())
+    stat = out(src, "diff", "--shortstat", base, ref)
+    if stat and OUT is not None:
+        line = Text("  " + stat, style="muted")
+        line.highlight_regex(r"\d+ insertions?\(\+\)", "green")
+        line.highlight_regex(r"\d+ deletions?\(-\)", "red")
+        OUT.print(line)
+    elif stat:
+        note(stat)
     _, patch = close_review(src, name, task)
     wt = review_of(name, task)
     wt.parent.mkdir(parents=True, exist_ok=True)
@@ -579,7 +700,8 @@ def cmd_review(a) -> None:
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
         note("opened in VS Code: Source Control lists every change the agent made")
     note("Small fixes: edit here or after `agent merge`; your edits come along either way.")
-    note(f"Take the changes: agent merge {task}    Close: agent review {task} --close")
+    hint("Take the changes", f"agent merge {task}")
+    hint("Close", f"agent review {task} --close")
 
 
 def cmd_merge(a) -> None:
@@ -647,8 +769,8 @@ def cmd_merge(a) -> None:
         return
     ok(f"agent/{task}'s changes are staged in your repo, not committed")
     note("Check them in VS Code, fix anything you like, then commit. The message is pre-filled:")
-    note(f"  {message.splitlines()[0]}")
-    note("To undo: git reset --merge")
+    panel(message.strip(), "Commit message")
+    hint("To undo", "git reset --merge")
 
 
 def cmd_list(_a) -> None:
@@ -666,9 +788,9 @@ def cmd_list(_a) -> None:
             flags.append("agent clone missing")
         if not info.get("hooks"):
             flags.append("manual push")
-        rows.append([name, str(src), ", ".join(flags) or "ok"])
+        rows.append([name, str(src), (", ".join(flags) or "✓ ok", "warn" if flags else "ok")])
     heading(f"Shared repos · {len(rows)}")
-    table(["Project", "Your repo", "Status"], rows, ["bold green", "cyan", ""])
+    table(["Project", "Your repo", "Status"], rows, ["name", "path", ""])
 
 
 def cmd_unshare(a) -> None:
@@ -784,9 +906,13 @@ def machine_file() -> Path:
 def build_image(version: str | None) -> None:
     info = json.loads(machine_file().read_text()) if machine_file().exists() else {}
     version = version or info.get("claude_code") or "latest"
-    print(f"Building {IMAGE} with Claude Code {version} …")
+    check_docker_space()
+    heading(f"Building {IMAGE} with Claude Code {version}")
     run(["docker", "build", "--build-arg", f"CLAUDE_CODE_VERSION={version}", "-t", IMAGE,
          REPO / "container"], capture=False)
+    freed = remove_old_images()  # each rebuild leaves the previous image untagged
+    if freed:
+        ok(f"removed the previous image ({human(freed)} freed)")
     p = run(["docker", "run", "--rm", "--entrypoint", "claude", IMAGE, "--version"], check=False)
     m = re.search(r"\d+\.\d+\.\d+", p.stdout or "")
     info.update({"claude_code": m.group(0) if m else version, "built": time.strftime("%Y-%m-%d %H:%M")})
@@ -805,9 +931,32 @@ def preflight() -> None:
         raise Fail("cannot reach the Docker daemon. Start Docker, or add yourself to the docker group and log in again")
 
 
+def choose_home(a) -> None:
+    """Settle where the agent keeps its data: --home, the saved choice, or ask once."""
+    global AGENT_HOME
+    if a.home:
+        new = Path(a.home).expanduser().resolve()
+        if os.environ.get("AGENT_HOME") and Path(os.environ["AGENT_HOME"]).expanduser().resolve() != new:
+            raise Fail("AGENT_HOME is set in your environment and differs from --home")
+        if (AGENT_HOME / ".env").exists() and AGENT_HOME.resolve() != new:
+            raise Fail(f"already set up in {AGENT_HOME}. To move it: agent storage move {new}")
+    elif os.environ.get("AGENT_HOME") or load_config().get("home") or AGENT_HOME.exists() or not interactive():
+        return
+    else:
+        new = pick_home()
+    prepare_home(new)
+    AGENT_HOME = new
+    save_config(home=str(new))
+    ok(f"the agent keeps its data in {new}")
+    d = disk(new)
+    if d and d[0] < LOW_FREE:
+        warn(f"only {human(d[0])} free there")
+
+
 def cmd_setup(a) -> None:
     if not a.no_build or not a.no_start:
         preflight()
+    choose_home(a)
     for d in dirs().values():
         d.mkdir(parents=True, exist_ok=True)
     write_env()
@@ -820,36 +969,35 @@ def cmd_setup(a) -> None:
     if not a.no_start:
         compose("up", "-d")
     ok(f"set up in {AGENT_HOME}")
-    note("Next (once per machine): agent login    Then: agent share PATH --yes")
+    root = docker_root()
+    d = disk(root) if root else None
+    if d and d[0] < LOW_FREE:
+        warn(f"Docker's disk ({root}) has only {human(d[0])} free.")
+        hint("Move Docker's data to a bigger disk", f"agent storage docker-move {suggest_docker_root()}")
+    if not any(f.exists() for f in completion_targets().values()):
+        hint("Tab completion", "agent completion install")
+    hint("Next (once per machine)", "agent login")
+    hint("Then", "agent share PATH --yes")
 
 
 def cmd_doctor(_a) -> None:
-    bad = 0
+    counts = {"bad": 0, "warn": 0, "good": 0}
 
-    def check(label: str, good: bool, hint: str = "") -> None:
-        nonlocal bad
-        tail = "" if good or not hint else f"  → {hint}"
+    def check(label: str, good: bool, hint_: str = "", level: str = "bad") -> None:
+        state = "good" if good else level
+        counts[state] += 1
+        tail = "" if good or not hint_ else f"  → {hint_}"
+        mark = {"good": "✓", "warn": "!", "bad": "✗"}[state]
         if OUT is None:
-            print(f"  {'✓' if good else '✗'} {label}{tail}")
+            print(f"  {mark} {label}{tail}")
         else:
-            OUT.print(Text.assemble(("  ✓ " if good else "  ✗ ", "bold green" if good else "bold red"),
+            OUT.print(Text.assemble((f"  {mark} ", {"good": "ok", "warn": "warn", "bad": "bad"}[state]),
                                     label, (tail, "yellow")))
-        bad += not good
 
-    heading("agent doctor")
-
+    heading("Tools")
     docker = shutil.which("docker") is not None
     check("git installed", shutil.which("git") is not None)
     check("docker installed", docker)
-    if docker:
-        check("docker daemon reachable", run(["docker", "info"], check=False).returncode == 0)
-        check("image built", run(["docker", "image", "inspect", IMAGE], check=False).returncode == 0, "agent setup")
-        check("container running", container_running(), "agent up")
-    check("set up", (AGENT_HOME / "compose.yaml").exists(), "agent setup")
-    if docker and container_running():
-        status = run(["docker", "exec", CONTAINER, "claude", "auth", "status"], check=False).stdout
-        check("logged in to Claude", bool(re.search(r'"loggedIn":\s*true', status)), "agent login")
-    check("vault exists", (dirs()["vault"] / ".git").is_dir(), "agent setup")
     launcher = shutil.which("agent")
     me = str(Path(__file__).resolve())
     mine = launcher is not None and (Path(launcher).resolve() == Path(me)
@@ -857,21 +1005,605 @@ def cmd_doctor(_a) -> None:
     check("`agent` on PATH", mine, "run ./install.sh, or add ~/.local/bin to PATH")
     check("pretty output (Rich)", OUT is not None or os.environ.get("AGENT_PLAIN") == "1",
           "re-run ./install.sh (Ubuntu may need: sudo apt install python3-venv)")
+    check("shell completion installed", any(f.exists() for f in completion_targets().values()),
+          "agent completion install", level="warn")
+
+    heading("Container")
+    reachable = docker and run(["docker", "info"], check=False).returncode == 0
+    if docker:
+        check("docker daemon reachable", reachable)
+        check("image built", run(["docker", "image", "inspect", IMAGE], check=False).returncode == 0, "agent setup")
+        check("container running", container_running(), "agent up")
+    check("set up", (AGENT_HOME / "compose.yaml").exists(), "agent setup")
+    if docker and container_running():
+        st = run(["docker", "exec", CONTAINER, "claude", "auth", "status"], check=False).stdout
+        check("logged in to Claude", bool(re.search(r'"loggedIn":\s*true', st)), "agent login")
+    check("vault exists", (dirs()["vault"] / ".git").is_dir(), "agent setup")
+
+    heading("Storage")
+    d = disk(AGENT_HOME)
+    if d:
+        check(f"agent data: {human(d[0])} free at {AGENT_HOME}", d[0] >= LOW_FREE,
+              "agent storage move /bigger/disk/Agent", level="warn")
+    root = docker_root() if reachable else None
+    dd = disk(root) if root else None
+    if dd:
+        check(f"docker data: {human(dd[0])} free at {root}", dd[0] >= LOW_FREE,
+              "agent storage clean, or move it: agent storage docker-move PATH", level="warn")
+    if reachable:
+        old = old_images()
+        check(f"{len(old)} old agent image(s) left by rebuilds" if old else "no old agent images", not old,
+              f"agent storage clean (frees up to {human(sum(i['size'] for i in old))})", level="warn")
+
+    if load_registry():
+        heading("Projects")
     for name, info in sorted(load_registry().items()):
         src = Path(info["source"])
         url = git(src, "remote", "get-url", "agent", check=False).stdout.strip() if src.is_dir() else ""
         check(f"{name}: repo, mirror, clone, remote",
               src.is_dir() and mirror_of(name).is_dir() and work_of(name).is_dir() and url == str(work_of(name)),
-              f"agent unshare {name} --yes, then share again")
-    sys.exit(1 if bad else 0)
+              f"agent unshare --project {name} --yes, then share again")
+
+    print()
+    if counts["bad"]:
+        error(f"{counts['bad']} problem(s), {counts['warn']} warning(s)")
+    elif counts["warn"]:
+        warn(f"healthy, with {counts['warn']} warning(s)")
+    else:
+        ok(f"all {counts['good']} checks passed")
+    sys.exit(1 if counts["bad"] else 0)
+
+
+# ---------------------------------------------------------------- storage
+# Where the agent's data lives (AGENT_HOME, chosen at setup) and what Docker
+# keeps on its own disk: the image, old untagged images left by rebuilds, and
+# the build cache.
+
+REAL_FS = {"ext2", "ext3", "ext4", "xfs", "btrfs", "zfs", "f2fs", "jfs", "bcachefs", "reiserfs", "apfs", "hfs"}
+SKIP_MOUNTS = ("/boot", "/efi", "/snap", "/var/lib/docker", "/var/snap", "/run", "/proc", "/sys", "/dev", "/tmp")
+
+
+def existing(path: Path) -> Path:
+    path = Path(path).expanduser()
+    while not path.exists() and path != path.parent:
+        path = path.parent
+    return path
+
+
+def disk(path) -> tuple[int, int] | None:
+    """(free, total) bytes on the filesystem holding path (or its nearest existing parent)."""
+    try:
+        u = shutil.disk_usage(existing(Path(path)))
+        return u.free, u.total
+    except OSError:
+        return None
+
+
+def same_disk(a, b) -> bool:
+    try:
+        return os.stat(existing(Path(a))).st_dev == os.stat(existing(Path(b))).st_dev
+    except OSError:
+        return False
+
+
+def dir_size(path: Path) -> int:
+    if not path.exists():
+        return 0
+    p = run(["du", "-sk", path], check=False)
+    try:
+        return int(p.stdout.split()[0]) * 1024
+    except (IndexError, ValueError):
+        return 0
+
+
+def real_mounts() -> list[Path]:
+    try:
+        lines = Path("/proc/self/mounts").read_text().splitlines()
+    except OSError:
+        return []
+    found = []
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 3 or parts[2] not in REAL_FS:
+            continue
+        mnt = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), parts[1])
+        if any(mnt == s or mnt.startswith(s + "/") for s in SKIP_MOUNTS) or not os.path.isdir(mnt):
+            continue
+        found.append(Path(mnt))
+    return found
+
+
+def can_create(path: Path) -> bool:
+    return os.access(existing(path), os.W_OK)
+
+
+def candidate_locations() -> list[dict]:
+    """~/Agent plus an Agent folder on each other real disk, one per filesystem."""
+    user = os.environ.get("USER") or Path.home().name
+    paths = [Path.home() / "Agent"]
+    for mnt in real_mounts():
+        if mnt == Path("/"):
+            continue
+        paths.append(mnt / "Agent" if os.access(mnt, os.W_OK) or mnt == Path("/") else mnt / user / "Agent")
+    seen, out_ = set(), []
+    for path in paths:
+        try:
+            key = os.statvfs(existing(path)).f_fsid or os.stat(existing(path)).st_dev
+        except OSError:
+            continue
+        d = disk(path)
+        if key in seen or not d:
+            continue
+        seen.add(key)
+        out_.append({"path": path, "free": d[0], "total": d[1], "ready": can_create(path)})
+    return out_
+
+
+def pick_home() -> Path:
+    """Ask where the agent keeps its data, suggesting the disk with the most free space."""
+    cands = candidate_locations()
+    if not cands:
+        return Path.home() / "Agent"
+    best = max(range(len(cands)), key=lambda i: cands[i]["free"])
+    root = docker_root()
+    heading("Where should the agent keep its data?")
+    note("Repos the agent works on, mirrors, review copies, its Claude login and the vault go here.")
+    rows = []
+    for i, c in enumerate(cands, 1):
+        tags = []
+        if c["path"].is_relative_to(Path.home()):
+            tags.append("your home")
+        if root and same_disk(c["path"], root):
+            tags.append("Docker's disk")
+        if not c["ready"]:
+            tags.append("needs sudo to create")
+        free_style = "bad" if c["free"] < LOW_FREE else "ok" if i - 1 == best else ""
+        rows.append([(f"{i}" + (" ★" if i - 1 == best else ""), "head"), (str(c["path"]), "path"),
+                     (human(c["free"]), free_style), human(c["total"]), ", ".join(tags)])
+    table(["#", "Location", "Free", "Disk size", ""], rows)
+    answer = ask(f"Choose 1-{len(cands)}, or type a path", str(best + 1))
+    if answer.isdigit() and 1 <= int(answer) <= len(cands):
+        return cands[int(answer) - 1]["path"]
+    return Path(answer).expanduser().resolve()
+
+
+def prepare_home(path: Path) -> None:
+    """Create the data folder, with sudo (after asking) if its parent isn't yours."""
+    if path.is_dir() and os.access(path, os.W_OK):
+        return
+    if can_create(path):
+        path.mkdir(parents=True, exist_ok=True)
+        return
+    cmd = ["sudo", "install", "-d", "-o", str(os.getuid()), "-g", str(os.getgid()), str(path)]
+    if interactive() and confirm(f"{existing(path)} isn't writable by you. Create {path} with sudo?", True):
+        run(cmd, capture=False)
+        return
+    raise Fail(f"can't create {path}. Run: {' '.join(cmd)}\nthen run setup again")
+
+
+def docker_info(fmt: str) -> str:
+    if not shutil.which("docker"):
+        return ""
+    p = run(["docker", "info", "-f", fmt], check=False)
+    return p.stdout.strip() if p.returncode == 0 else ""
+
+
+def docker_root() -> Path | None:
+    root = docker_info("{{.DockerRootDir}}")
+    return Path(root) if root else None
+
+
+def old_images() -> list[dict]:
+    """Untagged agent images left behind by rebuilds (recognised by their entrypoint)."""
+    p = run(["docker", "images", "-q", "--no-trunc", "-f", "dangling=true"], check=False)
+    ids = sorted(set(p.stdout.split())) if p.returncode == 0 else []
+    if not ids:
+        return []
+    p = run(["docker", "image", "inspect", "-f", "{{.Id}} {{.Size}} {{json .Config.Entrypoint}}", *ids], check=False)
+    found = []
+    for line in p.stdout.splitlines():
+        parts = line.split(" ", 2)
+        if len(parts) == 3 and ENTRYPOINT in parts[2]:
+            found.append({"id": parts[0], "size": int(parts[1])})
+    return found
+
+
+def remove_old_images() -> int:
+    old = old_images()
+    if old:
+        run(["docker", "rmi", *[i["id"] for i in old]], check=False)
+    return sum(i["size"] for i in old)
+
+
+def build_cache_size() -> str:
+    p = run(["docker", "system", "df", "--format", "{{.Type}}\t{{.Size}}\t{{.Reclaimable}}"], check=False)
+    for line in p.stdout.splitlines():
+        parts = line.split("\t")
+        if parts[0] == "Build Cache" and len(parts) == 3:
+            return parts[1]
+    return ""
+
+
+def check_docker_space(needed: int = BUILD_NEEDS) -> None:
+    """Before building: warn if Docker's disk is nearly full, and say what to do."""
+    root = docker_root()
+    d = disk(root) if root else None
+    if not d or d[0] >= needed:
+        return
+    warn(f"Docker keeps images in {root}, which has only {human(d[0])} free (a build needs about {human(needed)}).")
+    hint("Free space", "agent storage clean --build-cache")
+    hint("Or move Docker's data to a bigger disk", f"agent storage docker-move {suggest_docker_root()}")
+    if interactive() and not confirm("Build anyway?"):
+        raise Fail("cancelled")
+
+
+def suggest_docker_root() -> str:
+    cands = candidate_locations()
+    root = docker_root()
+    others = [c for c in cands if not root or not same_disk(c["path"], root)]
+    if not others:
+        return "/data/docker"
+    best = max(others, key=lambda c: c["free"])["path"]
+    return str((best.parent if best.name == "Agent" else best) / "docker")
+
+
+def cmd_storage(a) -> None:
+    heading("Agent data")
+    if AGENT_HOME.exists():
+        with status("measuring …"):
+            sizes = {n: dir_size(p) for n, p in dirs().items()}
+        total = dir_size(AGENT_HOME)
+    else:
+        sizes, total = {}, 0
+    d = disk(AGENT_HOME)
+    rows = [["Location", (str(AGENT_HOME), "path")], ["Using", (human(total), "bold")]]
+    if d:
+        rows.append(["Disk free", (f"{human(d[0])} of {human(d[1])}", "bad" if d[0] < LOW_FREE else "ok")])
+    parts = ", ".join(f"{n} {human(v)}" for n, v in sorted(sizes.items(), key=lambda kv: -kv[1]) if v)
+    if parts:
+        rows.append(["Breakdown", (parts, "muted")])
+    kv(rows)
+
+    heading("Docker")
+    root = docker_root()
+    if not root:
+        note("Docker isn't reachable, so its disk use can't be measured.")
+        return
+    dd = disk(root)
+    img = run(["docker", "image", "inspect", "-f", "{{.Size}}", IMAGE], check=False)
+    old = old_images()
+    cache = build_cache_size()
+    ctr = run(["docker", "ps", "-a", "-s", "--filter", f"name=^/{CONTAINER}$", "--format", "{{.Size}}"],
+              check=False).stdout.strip()
+    rows = [["Location", (str(root), "path")]]
+    if dd:
+        rows.append(["Disk free", (f"{human(dd[0])} of {human(dd[1])}", "bad" if dd[0] < LOW_FREE else "ok")])
+    rows.append(["Agent image", human(int(img.stdout.strip())) if img.returncode == 0 else ("not built", "muted")])
+    rows.append(["Old agent images", (f"{len(old)}, up to {human(sum(i['size'] for i in old))}", "warn")
+                 if old else ("none", "muted")])
+    if cache:
+        rows.append(["Build cache", (f"{cache} (all your Docker builds)", "")])
+    if ctr:
+        rows.append(["Container", (f"{ctr} (its own files outside the mounted folders)", "")])
+    kv(rows)
+    if old or cache not in ("", "0B"):
+        hint("Free Docker space", "agent storage clean" + ("" if not cache or cache == "0B" else " --build-cache"))
+    if dd and dd[0] < LOW_FREE:
+        hint("Move Docker's data to a bigger disk", f"agent storage docker-move {suggest_docker_root()}")
+    if d and d[0] < LOW_FREE:
+        hint("Move the agent's data", "agent storage move /bigger/disk/Agent")
+
+
+def cmd_storage_clean(a) -> None:
+    root = docker_root()
+    if not root:
+        raise Fail("cannot reach Docker")
+    before = disk(root)
+    freed = remove_old_images()
+    ok(f"removed old agent images ({human(freed)})" if freed else "no old agent images to remove")
+    if a.build_cache:
+        note("The build cache only speeds up rebuilds; Docker recreates it when needed.")
+        if a.yes or (interactive() and confirm("Clear Docker's whole build cache (all projects, not just this one)?")):
+            run(["docker", "builder", "prune", "-f"], capture=False, check=False)
+        else:
+            note("kept the build cache (pass --yes to clear it without asking)")
+    after = disk(root)
+    if before and after:
+        ok(f"{human(max(after[0] - before[0], 0))} freed; {human(after[0])} now free at {root}")
+
+
+def cmd_storage_move(a) -> None:
+    """Move AGENT_HOME to another disk and point everything at the new place."""
+    global AGENT_HOME
+    old, new = AGENT_HOME.resolve(), Path(a.path).expanduser().resolve()
+    if os.environ.get("AGENT_HOME"):
+        raise Fail("AGENT_HOME is set in your environment; change it there instead")
+    if not old.is_dir():
+        raise Fail(f"nothing to move: {old} doesn't exist")
+    if new == old or old in new.parents or new in old.parents:
+        raise Fail("the new location must be outside the current one")
+    if new.exists() and any(new.iterdir()):
+        raise Fail(f"{new} exists and isn't empty")
+    if "'" in str(new) or "\n" in str(new):
+        raise Fail(f"unsupported character in path: {new}")
+    size, d = dir_size(old), disk(new)
+    heading("Move the agent's data")
+    kv([["From", (str(old), "path")], ["To", (str(new), "path")], ["Size", human(size)],
+                     ["Free there", human(d[0]) if d else "?"]])
+    if d and d[0] < size * 1.1:
+        raise Fail(f"not enough space at {new}")
+    if not a.yes and not (interactive() and confirm("Stop the container and move it?", True)):
+        print("Cancelled. Re-run with --yes to move.")
+        return
+    prepare_home(new)
+    was_running = shutil.which("docker") is not None and container_running()
+    if was_running:
+        compose("down")
+    with status(f"moving {human(size)} …"):
+        if same_disk(old, new):
+            new.rmdir()
+            os.rename(old, new)
+        else:
+            run(["cp", "-a", f"{old}/.", str(new)])
+            shutil.rmtree(old)
+    AGENT_HOME = new
+    if old == Path.home() / "Agent":
+        old.symlink_to(new)  # Obsidian and old habits keep working
+    save_config(home=str(new))
+    write_env()
+    for name, info in load_registry().items():
+        src = Path(info["source"])
+        if src.is_dir():
+            git(src, "remote", "set-url", "agent", work_of(name), check=False)
+            reviews = [p for p in (new / "review" / name).glob("*") if p.is_dir()]
+            if reviews:
+                git(src, "worktree", "repair", *reviews, check=False)
+    ok(f"moved to {new}" + (f" (and {old} now links there)" if old.is_symlink() else ""))
+    if was_running:
+        compose("up", "-d")
+
+
+def cmd_docker_move(a) -> None:
+    """Print the commands to move Docker's own data (needs root, so we don't run them)."""
+    target = Path(a.path).expanduser()
+    root = docker_root()
+    if not root:
+        raise Fail("cannot reach Docker")
+    os_name = docker_info("{{.OperatingSystem}}")
+    heading("Move Docker's data")
+    note(f"Docker keeps images, containers and build cache in {root}. These commands move all of it")
+    note(f"to {target}. They need root, so run them yourself; nothing changes until you do.")
+    if "Docker Desktop" in os_name:
+        hint("Docker Desktop", "Settings → Resources → Advanced → Disk image location")
+        return
+    rootless = root.is_relative_to(Path.home())
+    conf = Path.home() / ".config" / "docker" / "daemon.json" if rootless else Path("/etc/docker/daemon.json")
+    try:
+        current = json.loads(conf.read_text()) if conf.exists() else {}
+    except (OSError, ValueError):
+        current = None
+    merged = json.dumps({**(current or {}), "data-root": str(target)})
+    sudo, ctl = ("", "systemctl --user") if rootless else ("sudo ", "sudo systemctl")
+    steps = [
+        f"{ctl} stop docker docker.socket",
+        f"{sudo}mkdir -p {shlex.quote(str(target))}",
+        f"{sudo}rsync -aHAX --info=progress2 {shlex.quote(str(root))}/ {shlex.quote(str(target))}/",
+        f"echo {shlex.quote(merged)} | {sudo}tee {conf}",
+        f"{ctl} start docker",
+        "docker info -f '{{.DockerRootDir}}'   # should print " + str(target),
+        f"{sudo}rm -rf {shlex.quote(str(root))}   # only once everything works",
+    ]
+    if current is None:
+        warn(f"couldn't read {conf}; add \"data-root\": \"{target}\" to it by hand instead of step 4")
+    if OUT is None:
+        print("\n".join(f"  {s}" for s in steps))
+    else:
+        from rich.syntax import Syntax
+        OUT.print(Panel(Syntax("\n".join(steps), "bash", theme="ansi_dark", background_color="default"),
+                        border_style="cyan", expand=False))
+    note("rsync must be installed. After this, `agent up` starts the container from the moved data.")
+
+
+# ---------------------------------------------------------------- shell completion
+# `agent __complete SHELL WORDS…` prints "value<TAB>description<TAB>group" lines
+# from the argparse tree, plus live values: task names, projects, refs. The
+# scripts below call it; `agent completion install` puts one where your shell looks.
+
+def completion_targets() -> dict[str, Path]:
+    return {"bash": DATA_DIR / "bash-completion" / "completions" / "agent",
+            "zsh": DATA_DIR / "agent" / "completion.zsh",
+            "fish": Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "fish" / "completions" / "agent.fish"}
+
+
+def _project_for(words: list[str]) -> tuple[str, Path] | None:
+    try:
+        if "--project" in words[:-1]:
+            return resolve_project(words[words.index("--project") + 1])
+        return resolve_project(None)
+    except (Fail, IndexError, OSError, ValueError):
+        return None
+
+
+def complete_values(act: argparse.Action, words: list[str]) -> list[tuple[str, str, str]]:
+    dest = act.dest
+    if act.choices:
+        return [(str(c), "", "value") for c in act.choices]
+    if dest == "project":
+        return [(n, i["source"], "project") for n, i in sorted(load_registry().items())]
+    if dest in ("path", "target", "home"):
+        return [(":dirs", "", "")]
+    proj = _project_for(words)
+    if not proj:
+        return []
+    if dest == "task":
+        p = git(proj[1], "for-each-ref", "--format=%(refname:strip=3)\t%(subject)", "refs/remotes/agent/",
+                check=False)
+        return [(*line.split("\t", 1), "task") for line in p.stdout.splitlines() if "\t" in line]
+    if dest == "base":
+        p = git(proj[1], "for-each-ref", "--format=%(refname:short)", "refs/heads", "refs/tags", check=False)
+        return [(r, "", "ref") for r in ["HEAD", *p.stdout.split()]]
+    return []
+
+
+def complete(words: list[str]) -> list[tuple[str, str, str]]:
+    """Candidates for the last word, given the words before it."""
+    parser, cur, positional, pending = build_parser(), words[-1], 0, None
+    for w in words[:-1]:
+        if pending is not None:
+            pending = None
+            continue
+        if w.startswith("-"):
+            act = parser._option_string_actions.get(w.split("=", 1)[0])
+            if act is not None and act.nargs != 0 and "=" not in w:
+                pending = act
+            continue
+        subs = [x for x in parser._actions if isinstance(x, argparse._SubParsersAction)]
+        if subs and w in subs[0].choices:
+            parser, positional = subs[0].choices[w], 0
+        else:
+            positional += 1
+    if pending is not None:
+        return complete_values(pending, words)
+    if cur.startswith("-"):
+        used = set(words[:-1])
+        return [(opt, act.help or "", "option") for act in parser._actions if act.help != argparse.SUPPRESS
+                for opt in act.option_strings if opt.startswith("--") and opt not in used]
+    found = []
+    for act in parser._actions:
+        if isinstance(act, argparse._SubParsersAction):
+            found += [(c.dest, c.help or "", "command") for c in act._choices_actions]
+            return found
+    positionals = [x for x in parser._actions if not x.option_strings and x.nargs != argparse.SUPPRESS]
+    if positional < len(positionals):
+        found += complete_values(positionals[positional], words)
+    return found
+
+
+COMPLETION_SCRIPTS = {
+    "bash": r"""# agent shell completion for bash (generated by: agent completion bash)
+_agent() {
+  local cur=${COMP_WORDS[COMP_CWORD]} value desc group
+  COMPREPLY=()
+  while IFS=$'\t' read -r value desc group; do
+    case $value in
+      :files) compopt -o filenames 2>/dev/null; mapfile -t -O "${#COMPREPLY[@]}" COMPREPLY < <(compgen -f -- "$cur") ;;
+      :dirs)  compopt -o filenames 2>/dev/null; mapfile -t -O "${#COMPREPLY[@]}" COMPREPLY < <(compgen -d -- "$cur") ;;
+      *) COMPREPLY+=("$value") ;;
+    esac
+  done < <(agent __complete bash "${COMP_WORDS[@]:1:COMP_CWORD}" 2>/dev/null)
+}
+complete -F _agent agent
+# Highlight the part you've typed in the list of matches (AGENT_COMPLETION_COLORS=0 to skip).
+if [[ $- == *i* && ${AGENT_COMPLETION_COLORS:-1} != 0 ]]; then
+  bind 'set colored-completion-prefix on' 2>/dev/null
+  bind 'set colored-stats on' 2>/dev/null
+fi
+""",
+    "zsh": r"""# agent shell completion for zsh (generated by: agent completion zsh)
+_agent() {
+  local line value desc group rest
+  local -a lines command task project ref option value
+  lines=("${(@f)$(agent __complete zsh "${(@)words[2,CURRENT]}" 2>/dev/null)}")
+  for line in $lines; do
+    value=${line%%$'\t'*}; rest=${line#*$'\t'}; desc=${rest%%$'\t'*}; group=${rest#*$'\t'}
+    case $value in
+      :files) _files; continue ;;
+      :dirs)  _files -/; continue ;;
+      '') continue ;;
+    esac
+    [[ -n $group ]] || continue
+    set -A $group "${(@P)group}" "${value//:/\\:}:$desc"
+  done
+  (( $#command )) && _describe -t commands 'command' command
+  (( $#task ))    && _describe -t tasks 'agent task' task
+  (( $#project )) && _describe -t projects 'shared repo' project
+  (( $#ref ))     && _describe -t refs 'ref' ref
+  (( $#value ))   && _describe -t values 'value' value
+  (( $#option ))  && _describe -t options 'option' option
+  return 0
+}
+zstyle ':completion:*:*:agent:*' group-name ''
+zstyle ':completion:*:*:agent:*:descriptions' format '%F{cyan}%B── %d%b%f'
+zstyle ':completion:*:*:agent:*:commands' list-colors '=(#b)([^ ]#)*=0=1;35'
+zstyle ':completion:*:*:agent:*:tasks' list-colors '=(#b)([^ ]#)*=0=1;32'
+zstyle ':completion:*:*:agent:*:projects' list-colors '=(#b)([^ ]#)*=0=1;32'
+zstyle ':completion:*:*:agent:*:options' list-colors '=(#b)([^ ]#)*=0=33'
+(( $+functions[compdef] )) || { autoload -Uz compinit && compinit -i; }
+compdef _agent agent
+""",
+    "fish": r"""# agent shell completion for fish (generated by: agent completion fish)
+function __agent_complete
+    set -l words (commandline -opc)[2..-1] (commandline -ct)
+    agent __complete fish $words 2>/dev/null | while read -l line
+        set -l parts (string split \t -- $line)
+        switch $parts[1]
+            case :files
+                __fish_complete_path (commandline -ct)
+            case :dirs
+                __fish_complete_directories (commandline -ct)
+            case '*'
+                printf '%s\t%s\n' $parts[1] $parts[2]
+        end
+    end
+end
+complete -c agent -f -a '(__agent_complete)'
+""",
+}
+ZSHRC_LINE = "[ -r {f} ] && source {f}  # agent shell completion"
+
+
+def cmd_complete(argv: list[str]) -> None:
+    shell, words = (argv[0] if argv else "bash"), (argv[1:] or [""])
+    try:
+        found = complete(words)
+    except Exception:  # never break the user's shell
+        return
+    cur = words[-1]
+    for value, desc, group in found:
+        if value.startswith(":") or shell == "zsh" or value.startswith(cur):
+            print(f"{value}\t{sanitize(desc).replace(chr(9), ' ')}\t{group}")
+
+
+def cmd_completion(a) -> None:
+    if a.action != "install":
+        sys.stdout.write(COMPLETION_SCRIPTS[a.action])
+        return
+    shell = a.shell or Path(os.environ.get("SHELL", "bash")).name
+    if shell not in COMPLETION_SCRIPTS:
+        raise Fail(f"no completion for {shell!r}; supported: bash, zsh, fish")
+    f = completion_targets()[shell]
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(COMPLETION_SCRIPTS[shell])
+    ok(f"{shell} completion installed: {f}")
+    if shell == "zsh":
+        rc = Path(os.environ.get("ZDOTDIR") or Path.home()) / ".zshrc"
+        line = ZSHRC_LINE.format(f=shlex.quote(str(f)))
+        text = rc.read_text() if rc.exists() else ""
+        if line not in text:
+            rc.write_text(text + ("" if text.endswith("\n") or not text else "\n") + line + "\n")
+            note(f"added a line to {rc} that loads it")
+    elif shell == "bash":
+        note("bash-completion loads it automatically (Ubuntu/Debian have it by default).")
+    note("Open a new terminal, then try: agent <Tab><Tab>")
 
 
 # ---------------------------------------------------------------- main
 
-def main(argv=None) -> None:
+EPILOG = """\
+Typical day:
+  `agent pull`             see what the agent did
+  `agent review <task>`    read its handoff, open the changes in VS Code
+  `agent merge <task>`     take the changes into your repo, staged
+
+Disk space: `agent storage`.  Tab completion: `agent completion install`.
+"""
+
+
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="agent", description="Host CLI for the Claude Code agent container.",
-                                 formatter_class=HELP_FORMAT)
-    sub = ap.add_subparsers(dest="cmd", required=True, metavar="COMMAND")
+                                 epilog=EPILOG, formatter_class=HELP_FORMAT)
+    ap._positionals.title = "Commands"
+    sub = ap.add_subparsers(dest="cmd", metavar="COMMAND")
     add_parser = sub.add_parser
     sub.add_parser = lambda *args, **kw: add_parser(*args, formatter_class=HELP_FORMAT, **kw)
 
@@ -879,6 +1611,8 @@ def main(argv=None) -> None:
     s.add_argument("--claude-version", help="Claude Code version for the image (default: pinned, else latest)")
     s.add_argument("--no-build", action="store_true", help="skip building the image")
     s.add_argument("--no-start", action="store_true", help="do not start the container")
+    s.add_argument("--home", metavar="PATH",
+                   help="where the agent keeps its data (default: asks, suggesting the disk with most space)")
     s.set_defaults(fn=cmd_setup)
 
     for cmd, fn, help_ in (("up", lambda a: compose("up", "-d"), "start the container"),
@@ -932,7 +1666,41 @@ def main(argv=None) -> None:
     for name in ("push", "pull", "review", "merge", "unshare"):
         sub.choices[name].add_argument("--project", help="shared repo name (default: the repo you're in)")
 
+    s = sub.add_parser("storage", help="disk space used by the agent and Docker; clean up or move it")
+    s.set_defaults(fn=cmd_storage)
+    st = s.add_subparsers(dest="storage_cmd", metavar="ACTION")
+    st_add = st.add_parser
+    st.add_parser = lambda *args, **kw: st_add(*args, formatter_class=HELP_FORMAT, **kw)
+    c = st.add_parser("clean", help="remove old agent images left by rebuilds")
+    c.add_argument("--build-cache", action="store_true", help="also clear Docker's build cache (all projects)")
+    c.add_argument("--yes", action="store_true", help="don't ask")
+    c.set_defaults(fn=cmd_storage_clean)
+    c = st.add_parser("move", help="move the agent's data to another folder or disk")
+    c.add_argument("target", metavar="PATH")
+    c.add_argument("--yes", action="store_true", help="don't ask")
+    c.set_defaults(fn=lambda a: cmd_storage_move(argparse.Namespace(path=a.target, yes=a.yes)))
+    c = st.add_parser("docker-move", help="show the commands to move Docker's own data to another disk")
+    c.add_argument("target", metavar="PATH")
+    c.set_defaults(fn=lambda a: cmd_docker_move(argparse.Namespace(path=a.target)))
+
+    s = sub.add_parser("completion", help="shell tab completion: install it, or print the script")
+    s.add_argument("action", choices=["install", "bash", "zsh", "fish"],
+                   help="install: for your shell ($SHELL); or print the script for one shell")
+    s.add_argument("--shell", choices=["bash", "zsh", "fish"], help="with install: this shell instead of $SHELL")
+    s.set_defaults(fn=cmd_completion)
+    return ap
+
+
+def main(argv=None) -> None:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["__complete"]:
+        cmd_complete(argv[1:])
+        return
+    ap = build_parser()
     a = ap.parse_args(argv)
+    if not getattr(a, "fn", None):
+        ap.print_help()
+        return
     a.fn(a)
 
 

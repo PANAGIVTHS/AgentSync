@@ -16,3 +16,6 @@ services:
       - ${AGENT_HANDOFFS_DIR}:/handoffs        # task summaries for your review
       - ${AGENT_VAULT_DIR}:/vault              # Obsidian memory
     restart: unless-stopped
+    logging:                                   # keep `docker logs` from filling Docker's disk
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }

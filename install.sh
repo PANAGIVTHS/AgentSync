@@ -56,4 +56,7 @@ case ":$PATH:" in
   *":$BIN:"*) ;;
   *) echo "! $BIN is not on your PATH. Add this to your shell profile: export PATH=\"\$HOME/.local/bin:\$PATH\"" ;;
 esac
+# Tab completion for your shell (bash, zsh or fish); harmless if it can't.
+"$PY" "$HERE/cli/agent.py" completion install >/dev/null 2>&1 && echo "✓ tab completion installed (open a new terminal)" || true
+# `agent setup` asks where to keep the agent's data the first time (or pass --home PATH).
 exec "$PY" "$HERE/cli/agent.py" setup "$@"

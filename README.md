@@ -21,8 +21,8 @@ cd ~/agent-setup
 agent login
 ```
 
-`install.sh` creates a small Python environment for the CLI (`~/.local/share/agent/venv`, with Rich for tables and coloured output). If that isn't possible, for example on Ubuntu without `python3-venv`, the CLI still works with plain output. It then puts `agent` on your PATH (`~/.local/bin`) and runs `agent setup`, which:
-- creates `~/Agent/`;
+`install.sh` creates a small Python environment for the CLI (`~/.local/share/agent/venv`, with Rich for tables and coloured output). If that isn't possible, for example on Ubuntu without `python3-venv`, the CLI still works with plain output. It then puts `agent` on your PATH (`~/.local/bin`), installs tab completion for your shell, and runs `agent setup`, which:
+- asks where to keep the agent's data the first time, listing each disk with its free space and suggesting the one with the most (`./install.sh --home /data/Agent` skips the question). The choice is saved in `~/.config/agent/config.json`;
 - installs the agent's Claude config;
 - creates the Obsidian vault;
 - builds the image, pinning the Claude Code version it installed;
@@ -93,6 +93,31 @@ Options:
 - `agent up`, `agent down` and `agent logs` start, stop and show the container.
 - `agent shell` opens a shell inside it.
 - `agent unshare --project NAME` stops sharing a repo.
+
+## Tab completion
+
+`agent completion install` sets it up for your shell (`install.sh` does this for you). Then open a new terminal. Tab completes commands, options, your shared repos, and the agent's task names with their last commit:
+- **zsh and fish** show a description next to each match, grouped and coloured.
+- **bash** completes the same names and highlights the part you've typed. Set `AGENT_COMPLETION_COLORS=0` to leave your readline colours alone.
+
+`agent completion bash|zsh|fish` prints the script instead, if you'd rather install it yourself.
+
+## Disk space
+
+`agent storage` shows what takes space, and where:
+- **The agent's data:** repos it works on, mirrors, review copies, its login and the vault, with free space on that disk.
+- **Docker's data:** the agent image, old agent images, the build cache, and the container's own files. Docker keeps these in its own folder (usually `/var/lib/docker`, on your system disk) wherever the agent's data is.
+
+Ways to free space:
+- **Old images.** Each rebuild (re-running `./install.sh`) used to leave the previous image behind, about 1 GB each. Builds now remove it. `agent storage clean` removes any left from earlier builds. It only touches images built from this repo.
+- **Build cache.** `agent storage clean --build-cache` also clears Docker's build cache. That cache belongs to all your Docker projects, so it asks first.
+- **Logs.** Container logs are capped at 30 MB.
+
+Moving things to another disk:
+- **The agent's data:** `agent storage move /data/Agent` stops the container, moves everything, updates your repos' `agent` remotes, and starts it again. If the old folder was `~/Agent`, it becomes a link to the new one.
+- **Docker's data:** `agent storage docker-move /data/docker` prints the commands that move Docker's data folder. They need root, so you run them yourself.
+
+`agent setup` and every build warn when Docker's disk is low, and `agent doctor` checks it too.
 
 ## Memory: the Obsidian vault
 
