@@ -20,6 +20,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -632,6 +633,37 @@ def squash_message(src: Path, task: str, base: str, sha: str) -> str:
     return TRAILER.sub("", sanitize(text))
 
 
+# Never sent in a WIP snapshot, even when .gitignore doesn't cover them.
+SECRET_EXCLUDES = tuple(f":(exclude,glob)**/{p}" for p in
+                        (".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx", "id_rsa*", "id_ed25519*"))
+
+
+def wip_snapshot(src: Path, branch: str) -> tuple[str, int]:
+    """Commit everything in your working folder (edits, staged or not, and new files
+    that .gitignore doesn't exclude) into a throwaway commit on top of HEAD, using a
+    temporary index so your own staging area is untouched. Returns (sha, new files)."""
+    with tempfile.TemporaryDirectory(prefix="agent-wip-") as tmp:
+        index = Path(tmp) / "index"
+        real = git_path(src, "index")
+        if real.exists():
+            shutil.copy2(real, index)
+        env = {**clean_env(), "GIT_INDEX_FILE": str(index)}
+
+        def g(*args) -> str:
+            p = subprocess.run(["git", "-C", str(src), *args], env=env, text=True, capture_output=True)
+            if p.returncode:
+                raise Fail(f"WIP snapshot failed: git {' '.join(args[:2])}\n{(p.stderr or p.stdout).strip()}")
+            return p.stdout.strip()
+
+        g("add", "--all", "--", ".", *SECRET_EXCLUDES)
+        tree = g("write-tree")
+        if tree == out(src, "rev-parse", "HEAD^{tree}"):
+            return "", 0
+        added = len([line for line in g("diff", "--cached", "--name-only", "--diff-filter=A", "HEAD").splitlines() if line])
+        sha = g("commit-tree", tree, "-p", "HEAD", "-m", f"WIP snapshot of {branch} (not committed by the user)")
+        return sha, added
+
+
 def cmd_push(a) -> None:
     name, src = resolve_project(a.project)
     push_mirror(src, name)
@@ -640,11 +672,13 @@ def cmd_push(a) -> None:
         heading(f"Push to the agent · {name}")
     if a.wip:
         branch = out(src, "branch", "--show-current") or "detached"
-        sha = out(src, "stash", "create")
+        sha, added = wip_snapshot(src, branch)
         if sha:
             git(src, "push", "--quiet", "--force", "--no-verify", mirror_of(name), f"{sha}:refs/wip/{branch}")
             if not a.quiet:
-                ok(f"sent uncommitted changes as desktop-wip/{branch} (untracked files not included)")
+                extra = f", including {added} new file{'s' if added != 1 else ''}" if added else ""
+                ok(f"sent your uncommitted work{extra} as desktop-wip/{branch}")
+                note("Your files and staging area are unchanged. Tell the agent to use desktop-wip/" + branch)
         elif not a.quiet:
             note("no uncommitted changes to send")
     if not a.quiet:

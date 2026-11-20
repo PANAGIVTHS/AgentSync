@@ -68,10 +68,26 @@ class CliTest(unittest.TestCase):
 
     def test_push_wip(self):
         self.share()
-        (self.user / "src" / "a.txt").write_text("changed\n")
-        self.assertIn("desktop-wip/main", self.agent("push", "--wip").stdout)
+        (self.user / "src" / "a.txt").write_text("changed\n")            # unstaged edit
+        (self.user / "staged.txt").write_text("staged\n")
+        self.s.git(self.user, "add", "staged.txt")                         # staged new file
+        (self.user / "src" / "new.sv").write_text("module m; endmodule\n")  # untracked new file
+        (self.user / ".gitignore").write_text("build/\n")
+        (self.user / "build").mkdir()
+        (self.user / "build" / "out.bit").write_text("ignored\n")        # ignored
+        (self.user / ".env").write_text("TOKEN=secret\n")                 # secret, not in .gitignore
+        index_before = self.s.git(self.user, "diff", "--cached", "--name-only").stdout
+        out = self.agent("push", "--wip").stdout
+        self.assertIn("desktop-wip/main", out)
+        self.assertIn("including 3 new files", out)                        # staged.txt, new.sv, .gitignore
         mirror = self.agent_home / "mirrors" / "myrepo.git"
+        files = self.s.git(mirror, "ls-tree", "-r", "--name-only", "refs/wip/main").stdout.split()
+        self.assertEqual(sorted(files), [".gitignore", "src/a.txt", "src/new.sv", "staged.txt"])  # no build/, no .env
         self.assertEqual(self.s.git(mirror, "show", "refs/wip/main:src/a.txt").stdout, "changed\n")
+        # Your staging area and history are untouched.
+        self.assertEqual(self.s.git(self.user, "diff", "--cached", "--name-only").stdout, index_before)
+        self.assertIn("?? src/new.sv", self.s.git(self.user, "status", "--porcelain").stdout)
+        self.assertEqual(self.s.git(self.user, "log", "--oneline").stdout.count("\n"), 1)
         # A normal push must not prune the WIP snapshot.
         self.agent("push")
         self.assertEqual(self.s.git(mirror, "rev-parse", "-q", "--verify", "refs/wip/main", check=False).returncode, 0)

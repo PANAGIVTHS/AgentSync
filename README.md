@@ -104,7 +104,7 @@ Options:
 - Running `agent review` again carries them into the fresh copy.
 - `agent review <task> --close` saves them as a patch and tells you where.
 
-`agent push --wip` sends your uncommitted tracked changes too; the agent sees them as `desktop-wip/<branch>`. Other commands:
+`agent push --wip` also sends everything you haven't committed: edits (staged or not) and new files. Files your `.gitignore` excludes, and secrets like `.env` or `*.key`, are left out. Your files and staging area stay as they are. The agent sees the snapshot as `desktop-wip/<branch>`; tell it to use it. Run it again after more edits. Other commands:
 - `agent list` and `agent doctor` show what's shared and whether everything is healthy.
 - `agent up`, `agent down` and `agent logs` start, stop and show the container.
 - `agent shell` opens a shell inside it.
