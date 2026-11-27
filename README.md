@@ -170,12 +170,12 @@ The image itself has `pip` and `venv`. For something every session needs, add th
 
 | Section | What it checks |
 |---|---|
-| Its own settings | Its `settings.json`, `CLAUDE.md` and skills match what `agent setup` installed. Lists skills, plugins, hooks or MCP servers added since. |
-| Git safety | Pushing is still disabled, the commit hook still applies, remotes still point at the read-only mirror, and no commits on branches outside `agent/*`. |
-| Commands it ran | Scans the saved chats for things worth a look: `sudo`, piping a download into a shell, setuid files, pushes, changing git safety settings, skipping hooks, deleting whole folders, editing its own settings, reaching for your PC or network, background processes. |
+| Its own settings | Its `settings.json`, `CLAUDE.md` and skills match what `agent setup` installed. Lists skills, plugins, hooks or MCP servers added since. Skills that Claude Code copies from your claude.ai account (`skills/synced/`) are only listed: each one's description goes into every chat, so turn off those you don't use in claude.ai. |
+| Git safety | Pushing is still disabled, the commit hook still applies, remotes still point at the read-only mirror, and no agent commits on branches outside `agent/*`. A branch left behind after you rewrote your own history isn't flagged. |
+| Commands it ran | Scans the saved chats for commands worth a look (only where a command starts, so a word in a file the agent was editing doesn't count): `sudo`, piping a download into a shell, setuid files, pushes, changing git safety settings, skipping hooks, deleting whole folders, editing its own settings, reaching for your PC or network, background processes. |
 | Tools folder | Links pointing outside `/tools`, setuid files, files not in the manifest, installs without a checksum, changes to `env.sh`. |
 | Secrets | Keys and tokens in the vault, handoffs and unmerged agent branches (shown masked). Also lists files in agent branches that your own tools act on by themselves: `.vscode/`, `.claude/`, `.github/workflows/`, `.envrc`, `.gitattributes` and similar. Look at those closely before merging. |
-| Container right now | Processes besides the usual ones, and open network ports. |
+| Container right now | Processes besides the usual ones, and open network ports with the process that opened each. Ports open only inside the container (Claude Code's own, Docker's DNS on 127.0.0.11, a local dev server) aren't flagged. |
 | Activity | Chats, commands, vault notes, handoffs, tools and agent commits in that period. |
 
 ✗ marks a problem and makes it exit with an error; ! marks something to look at. Changed settings, git safety settings and `env.sh` are put back by `agent setup --no-build` (it keeps a backup of what it replaces). For tool problems, ask the agent to run `tools check` and fix what it reports.

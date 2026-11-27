@@ -37,6 +37,7 @@ HOOK_BEGIN = "# >>> agent auto-push >>>"
 HOOK_END = "# <<< agent auto-push <<<"
 HOOK_NAMES = ("post-commit", "post-merge", "post-rewrite")
 NO_PUSH = "no-push://disabled"
+AGENT_EMAIL = "agent@localhost"  # the agent's committer identity (container/gitconfig)
 CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f\x9b]")
 GB = 1024 ** 3
 LOW_FREE = 5 * GB     # warn below this much free space
@@ -1291,25 +1292,50 @@ def cmd_doctor(_a) -> None:
 # only git commands it runs in agent-controlled folders read objects, with every
 # config option that could run a program switched off.
 
+# Patterns are matched where a command starts (not inside words or file text), and
+# the bodies of heredocs fed to non-shell programs (python3 - <<EOF …) are skipped:
+# they're file contents or code, and mentioning "docker" there isn't running it.
+CMD = (r"(?:^|\n|[;&|(`{]|\$\(|\b(?:then|do|else)\s)\s*(?:[A-Za-z_]\w*=\S*\s+)*"
+       r"(?:(?:command|exec|nohup|time|nice|env)\s+|timeout\s+(?:-\S+\s+)*\S+\s+)*")
 RISKY_COMMANDS = [
-    (re.compile(r"(^|[\s;&|(])(sudo|doas)\s|(^|[\s;&|(])su(\s+-)?(\s+\w+)?\s*($|[;&|])"), "tried to become root"),
-    (re.compile(r"\b(curl|wget)\b[^|;&]*\|\s*(sudo\s+)?(ba|z|da)?sh\b"), "piped a download into a shell"),
-    (re.compile(r"base64\s+(-d|--decode)\b[^|;&]*\|\s*(ba|z|da)?sh\b"), "ran decoded text as a script"),
-    (re.compile(r"\bchmod\s+(-\w+\s+)*(\S*[ug]\+\S*s|0?[2-7][0-7]{3})\b"), "made a setuid/setgid file"),
-    (re.compile(r"\bgit\s+(-\S+\s+(\S+\s+)?)*push\b"), "tried to push"),
-    (re.compile(r"(?i)\bgit\s+config\b[^;&|]*\b(pushurl|insteadof|hookspath|credential|fsmonitor|sshcommand|include)"),
-     "changed a git safety setting"),
-    (re.compile(r"--no-verify\b|\bgit\s+commit\b[^;&|]*\s-\w*n\b"), "skipped git hooks"),
-    (re.compile(r"\brm\s+(-\w+\s+)*-\w*[rR]\w*\s+(-\w+\s+)*[\"']?(/|~|\$HOME|/work|/vault|/home/agent|/mirrors|"
+    (re.compile(CMD + r"(sudo|doas|su)(\s|$)"), "tried to become root"),
+    (re.compile(r"\b(curl|wget)\b[^|;&\n]*\|\s*(sudo\s+)?(ba|z|da)?sh\b"), "piped a download into a shell"),
+    (re.compile(r"base64\s+(-d|--decode)\b[^|;&\n]*\|\s*(ba|z|da)?sh\b"), "ran decoded text as a script"),
+    (re.compile(CMD + r"chmod\s+(-\w+\s+)*(\S*[ug]\+\S*s|0?[2-7][0-7]{3})\b"), "made a setuid/setgid file"),
+    (re.compile(CMD + r"git\s+(-\S+\s+(\S+\s+)?)*push\b"), "tried to push"),
+    (re.compile(r"(?i)" + CMD + r"git\s+(-\S+\s+(\S+\s+)?)*config\b[^;&|\n]*\b(pushurl|insteadof|hookspath|credential|"
+                r"fsmonitor|sshcommand|include)"), "changed a git safety setting"),
+    (re.compile(CMD + r"git\s+(-\S+\s+(\S+\s+)?)*((commit|rebase|merge|am|cherry-pick)\b[^;&|\n]*--no-verify|"
+                      r"commit\b[^;&|\n]*\s-[A-Za-z]*n[A-Za-z]*\b)"), "skipped git hooks"),
+    (re.compile(CMD + r"rm\s+(-\w+\s+)*-\w*[rR]\w*\s+(-\w+\s+)*[\"']?(/|~|\$HOME|/work|/vault|/home/agent|/mirrors|"
                 r"/handoffs|/tools)/?[\"']?(\s|$|[;&|])"), "deleted a whole top-level folder"),
-    (re.compile(r"(>>?|\btee\b|\bsed\s+-i|\bcp\b|\bmv\b|\brm\b|\bln\b|\bchmod\b)[^;&|]*"
+    (re.compile(r"(>>?|\btee\b|\bsed\s+-i|\bcp\b|\bmv\b|\brm\b|\bln\b|\bchmod\b)[^;&|\n]*"
                 r"(/home/agent/|~/|\$HOME/)\.(claude|gitconfig)"), "changed its own settings"),
     (re.compile(r"host\.docker\.internal|\b172\.17\.0\.1\b|\b192\.168\.\d+\.\d+\b|\b10\.\d+\.\d+\.\d+\b"),
      "reached for your PC or home network"),
-    (re.compile(r"(^|[\s;&|(])(ssh|scp|sftp|nc|ncat|socat|telnet)\s"), "opened a connection to another machine"),
-    (re.compile(r"\bdocker\b|docker\.sock"), "tried to use Docker"),
-    (re.compile(r"\b(nohup|setsid|disown|crontab)\b"), "left a process running in the background"),
+    (re.compile(CMD + r"(ssh|scp|sftp|nc|ncat|socat|telnet)\s"), "opened a connection to another machine"),
+    (re.compile(CMD + r"docker(\s|$)|docker\.sock"), "tried to use Docker"),
+    (re.compile(CMD + r"(nohup|setsid|disown|crontab)\b|\bnohup\s"), "left a process running in the background"),
 ]
+HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+SHELLISH = re.compile(r"(^|[\s;&|(])((ba|z|da|k)?sh|source|eval|sudo|\.)(\s|$)")
+
+
+def without_data_heredocs(cmd: str) -> str:
+    """The command with heredoc bodies removed, unless the heredoc feeds a shell."""
+    keep, skip_until = [], None
+    for line in cmd.splitlines():
+        if skip_until is not None:
+            if line.strip() == skip_until:
+                skip_until = None
+            continue
+        keep.append(line)
+        m = HEREDOC.search(line)
+        if m and not SHELLISH.search(line[:m.start()]):
+            skip_until = m.group(2)
+    return "\n".join(keep)
+
+
 EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 PROTECTED_EDITS = re.compile(r"^(/home/agent/\.(claude|gitconfig)|/tools/env\.sh$|/opt/agent/|.*/\.git/(hooks/|config$))")
 SECRET_PATTERNS = [
@@ -1446,8 +1472,9 @@ def scan_transcripts(base: Path, since: float) -> dict:
                 if name == "Bash":
                     found["commands"] += 1
                     cmd = str(inp.get("command", ""))
+                    shown = without_data_heredocs(cmd)
                     for rx, label in RISKY_COMMANDS:
-                        if rx.search(cmd):
+                        if rx.search(shown):
                             found["flagged"].append((when, project, label, cmd))
                             break
                 elif name in EDIT_TOOLS:
@@ -1467,6 +1494,59 @@ def load_tools_module():
     mod = importlib.util.module_from_spec(spec)
     loader.exec_module(mod)
     return mod
+
+
+PORTS_SCRIPT = r"""
+cat /proc/net/tcp /proc/net/tcp6 2>/dev/null
+echo ---
+for p in /proc/[0-9]*; do
+  for fd in "$p"/fd/*; do
+    l=$(readlink "$fd" 2>/dev/null) || continue
+    case "$l" in socket:*) echo "${p#/proc/} $l" ;; esac
+  done
+done
+echo ---
+for p in /proc/[0-9]*; do printf '%s ' "${p#/proc/}"; tr '\0' ' ' < "$p/cmdline" 2>/dev/null; echo; done
+"""
+
+
+def decode_addr(hexaddr: str) -> str:
+    raw = bytes.fromhex(hexaddr)
+    if len(raw) == 4:
+        return ".".join(str(b) for b in reversed(raw))
+    words = [raw[i:i + 4][::-1] for i in range(0, 16, 4)]  # /proc stores IPv6 as four little-endian words
+    import ipaddress
+    return str(ipaddress.IPv6Address(b"".join(words)))
+
+
+def listening_ports() -> list[tuple[int, str, str]]:
+    """(port, address, process) for every listening TCP socket in the container."""
+    p = run(["docker", "exec", CONTAINER, "/bin/sh", "-c", PORTS_SCRIPT], check=False)
+    parts = (p.stdout or "").split("\n---\n")
+    if len(parts) < 3:
+        return []
+    sockets, pids, cmds = parts[0], parts[1], parts[2]
+    owner = {}
+    for line in pids.splitlines():
+        pid, _, link = line.partition(" ")
+        m = re.fullmatch(r"socket:\[(\d+)\]", link.strip())
+        if m:
+            owner.setdefault(m.group(1), pid)
+    cmdline = {}
+    for line in cmds.splitlines():
+        pid, _, cmd = line.partition(" ")
+        cmdline[pid] = cmd.strip()
+    found = set()
+    for line in sockets.splitlines():
+        f = line.split()
+        if len(f) > 9 and f[3] == "0A" and ":" in f[1]:
+            hexaddr, _, hexport = f[1].partition(":")
+            try:
+                addr = decode_addr(hexaddr)
+            except ValueError:
+                addr = "?"
+            found.add((int(hexport, 16), addr, sanitize(cmdline.get(owner.get(f[9], ""), ""))))
+    return sorted(found)
 
 
 def cmd_checkup(a) -> None:
@@ -1530,7 +1610,7 @@ def cmd_checkup(a) -> None:
     skills_dir = home / ".claude" / "skills"
     ours = {p.name for p in (REPO / "claude" / "skills").iterdir() if p.is_dir()}
     if skills_dir.is_dir() and no_links(base, skills_dir):
-        added += [f"skill: {p.name}" for p in sorted(skills_dir.iterdir()) if p.name not in ours]
+        added += [f"skill: {p.name}" for p in sorted(skills_dir.iterdir()) if p.name not in ours | {"synced"}]
     for sub in ("agents", "commands", "hooks"):
         d = home / ".claude" / sub
         if d.is_dir() and any(d.iterdir()):
@@ -1557,6 +1637,12 @@ def cmd_checkup(a) -> None:
         added.append("MCP servers: " + ", ".join(sorted(map(str, servers))))
     check("added skills, plugins, hooks or MCP servers (fine if you added them)", added, level="warn",
           good_label="no skills, plugins, hooks or MCP servers added")
+    synced = skills_dir / "synced"  # Claude Code copies your claude.ai account's skills here
+    if synced.is_dir() and no_links(base, synced):
+        names = sorted({f.parent.name for f in agent_files(base, synced, "SKILL.md")})
+        if names:
+            note(f"  {len(names)} skills synced from your claude.ai account: {', '.join(names)}. Each adds its "
+                 "description to every chat; turn off ones you don't use in claude.ai's skill settings.")
 
     # -- git safety
     subheading("Git safety")
@@ -1591,9 +1677,14 @@ def cmd_checkup(a) -> None:
             branch, _, sha = line.partition(" ")
             if branch.startswith("agent/") or not sha:
                 continue
-            upstream = f"refs/remotes/desktop/{branch}"
-            if agent_git(gitdir, "merge-base", "--is-ancestor", sha, upstream).returncode:
-                branch_issues.append(f"{name}: commits on '{branch}', outside agent/* (the commit hook was skipped)")
+            # Commits on your branch names that you never had: made by the agent with the hook skipped.
+            # (A branch left behind after you rewrote your history isn't flagged: those commits are yours.)
+            mine = agent_git(gitdir, "log", "-n", "200", "--format=%ce", sha, "--not", "--remotes=desktop",
+                             "--remotes=desktop-merged", "--remotes=desktop-wip").stdout.split()
+            n = sum(1 for e in mine if e == AGENT_EMAIL)
+            if n:
+                branch_issues.append(f"{name}: {n} agent commit(s) on '{branch}', outside agent/* "
+                                     "(the commit hook was skipped)")
     check("its git safety settings were changed", problems,
           fix=("Restore the agent's git settings", "agent setup --no-build"),
           good_label="pushing is disabled and the commit hook is in place")
@@ -1603,7 +1694,7 @@ def cmd_checkup(a) -> None:
     # -- what it ran
     subheading("Commands it ran")
     tr = scan_transcripts(base, since)
-    flagged = [f"{time.strftime('%m-%d %H:%M', time.localtime(w))}  {p}  {label}:  {' '.join(c.split())}"
+    flagged = [f"{time.strftime('%m-%d %H:%M', time.localtime(w))}  {p}  {label}:  {' '.join(c.split())[:110]}"
                for w, p, label, c in tr["flagged"]]
     check(f"{len(flagged)} worth a look ({tr['commands']} commands in {len(tr['chats'])} chat(s))", flagged,
           level="warn", good_label=f"nothing risky in {tr['commands']} command(s) across {len(tr['chats'])} chat(s)")
@@ -1683,14 +1774,21 @@ def cmd_checkup(a) -> None:
                 odd.append(f"{parts[2][:100]}  (running for {parts[1]})")
         check("other processes running (normal while a chat is working; otherwise left behind)", odd, level="warn",
               good_label="only the usual processes")
-        tcp = run(["docker", "exec", CONTAINER, "/bin/cat", "/proc/net/tcp", "/proc/net/tcp6"], check=False).stdout
-        ports = set()
-        for line in tcp.splitlines():
-            f = line.split()
-            if len(f) > 3 and f[3] == "0A" and ":" in f[1]:
-                ports.add(int(f[1].rsplit(":", 1)[1], 16))
-        check("listening on network ports", [f"port {p}" for p in sorted(ports)], level="warn",
-              good_label="no open network ports")
+        exposed, local = [], []
+        for port, addr, cmd in listening_ports():
+            if addr == "127.0.0.11" and not cmd:
+                continue  # Docker's built-in DNS server for the container's network
+            if addr.startswith("127.") or addr == "::1":
+                if not re.search(r"\bclaude\b", cmd):  # Claude Code's own isn't worth mentioning
+                    local.append(f"port {port}: {cmd[:80] or 'unknown process'}")
+            else:
+                exposed.append(f"port {port} on {addr}: {cmd[:80] or 'unknown process'}")
+        check("listening on network ports reachable from your PC", exposed, level="warn",
+              good_label="no network ports open to your PC")
+        if exposed:
+            note("  Not your network: the container publishes no ports. Fine if a chat is running a dev server now.")
+        if local:
+            note("  Also listening inside the container only (harmless): " + "; ".join(local[:5]))
 
     # -- activity
     subheading("Activity")
