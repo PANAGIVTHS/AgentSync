@@ -134,6 +134,8 @@ Options:
 Ways to free space:
 - **Old images.** Each rebuild (re-running `./install.sh`) used to leave the previous image behind, about 1 GB each. Builds now remove it. `agent storage clean` removes any left from earlier builds. It only touches images built from this repo.
 - **Build cache.** `agent storage clean --build-cache` also clears Docker's build cache. That cache belongs to all your Docker projects, so it asks first.
+- **The agent's temporary files.** `agent storage clean --temp` deletes the archives in `tools/downloads` (already unpacked; the manifest keeps where each came from), and the pip, uv and npm caches in `tools/caches` and the agent's home. Installed tools aren't touched, and a cache only refills when a tool needs it. It shows what it will delete and asks first. `agent storage` shows how much there is.
+- **Everything at once.** `agent storage clean --all` does `--temp` and `--build-cache` together.
 - **Logs.** Container logs are capped at 30 MB.
 
 Moving things to another disk:

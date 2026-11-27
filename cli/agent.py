@@ -2039,7 +2039,12 @@ def cmd_storage(a) -> None:
     parts = ", ".join(f"{n} {human(v)}" for n, v in sorted(sizes.items(), key=lambda kv: -kv[1]) if v)
     if parts:
         rows.append(["Breakdown", (parts, "muted")])
+    temp = temp_size() if AGENT_HOME.exists() else 0
+    if temp:
+        rows.append(["Temporary files", (f"{human(temp)} (downloads and caches; safe to delete)", "warn")])
     kv(rows)
+    if temp:
+        hint("Delete them", "agent storage clean --temp")
 
     heading("Docker")
     root = docker_root()
@@ -2071,9 +2076,56 @@ def cmd_storage(a) -> None:
         hint("Move the agent's data", "agent storage move /bigger/disk/Agent")
 
 
+# The agent's temporary files: safe to delete any time; they come back only if needed.
+# Downloads are archives already unpacked into /tools (the manifest keeps each URL and
+# checksum); caches are pip/uv/npm/Gradle's, here and in the agent's home from before /tools.
+TEMP_DIRS = ("tools/downloads", "tools/caches", "home/.cache/pip", "home/.cache/uv", "home/.npm/_cacache")
+
+
+def temp_dirs() -> list[Path]:
+    """The temp folders that exist and are real folders (never a link the agent could aim elsewhere)."""
+    base = AGENT_HOME.resolve()
+    return [base / d for d in TEMP_DIRS if (base / d).is_dir() and no_links(base, base / d)]
+
+
+def contents_size(folder: Path) -> int:
+    """What's inside folder (not the empty folder itself); links count as themselves."""
+    return sum(dir_size(c) if c.is_dir() and not c.is_symlink() else c.lstat().st_size for c in folder.iterdir())
+
+
+def temp_size() -> int:
+    return sum(contents_size(d) for d in temp_dirs())
+
+
+def clear_folder(folder: Path) -> None:
+    """Delete what's inside folder, keeping the folder. Links are removed, never followed."""
+    for child in folder.iterdir():
+        if child.is_symlink() or not child.is_dir():
+            child.unlink(missing_ok=True)
+        else:
+            shutil.rmtree(child, ignore_errors=True)
+
+
 def cmd_storage_clean(a) -> None:
+    if a.temp:
+        dirs_, size = temp_dirs(), temp_size()
+        if not size:
+            ok("no temporary files to remove")
+        else:
+            heading("The agent's temporary files")
+            kv([[str(d.relative_to(AGENT_HOME.resolve())), human(contents_size(d))] for d in dirs_ if contents_size(d)])
+            note("Downloads already unpacked into /tools, and pip/uv/npm caches. Nothing installed is touched; "
+                 "a cache refills only when a tool needs it. Best done while no chat is installing something.")
+            if a.yes or (interactive() and confirm(f"Delete them ({human(size)})?", True)):
+                for d in dirs_:
+                    clear_folder(d)
+                ok(f"removed {human(size - temp_size())} of temporary files")
+            else:
+                note("kept them (pass --yes to delete without asking)")
     root = docker_root()
     if not root:
+        if a.temp and not a.build_cache:
+            return
         raise Fail("cannot reach Docker")
     before = disk(root)
     freed = remove_old_images()
@@ -2682,10 +2734,14 @@ def build_parser() -> argparse.ArgumentParser:
     st = s.add_subparsers(dest="storage_cmd", metavar="ACTION")
     st_add = st.add_parser
     st.add_parser = lambda *args, **kw: st_add(*args, formatter_class=HELP_FORMAT, **kw)
-    c = st.add_parser("clean", help="remove old agent images left by rebuilds")
+    c = st.add_parser("clean", help="remove old agent images left by rebuilds; optionally temp files and caches")
+    c.add_argument("--temp", action="store_true",
+                   help="also delete the agent's temporary files: unpacked downloads and pip/uv/npm caches")
     c.add_argument("--build-cache", action="store_true", help="also clear Docker's build cache (all projects)")
+    c.add_argument("--all", action="store_true", help="--temp and --build-cache together")
     c.add_argument("--yes", action="store_true", help="don't ask")
-    c.set_defaults(fn=cmd_storage_clean)
+    c.set_defaults(fn=lambda a: cmd_storage_clean(argparse.Namespace(
+        temp=a.temp or a.all, build_cache=a.build_cache or a.all, yes=a.yes)))
     c = st.add_parser("move", help="move the agent's data to another folder or disk")
     c.add_argument("target", metavar="PATH", help="new folder, e.g. /data/Agent (must be empty or missing)")
     c.add_argument("--yes", action="store_true", help="don't ask")

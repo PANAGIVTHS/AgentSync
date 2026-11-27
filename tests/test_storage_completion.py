@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 import unittest
 
 from helpers import CLI, Sandbox
@@ -60,6 +61,49 @@ class StorageTest(unittest.TestCase):
         self.assertNotIn("builder prune", log)
         self.agent("storage", "clean", "--build-cache", "--yes")
         self.assertIn("builder prune -f", self.log.read_text())
+
+    def test_clean_temp_files(self):
+        home = self.s.root / "Agent"
+        tools = home / "tools"
+        for d in ("downloads", "caches/pip/http", "opt/oss-cad-suite/bin"):
+            (tools / d).mkdir(parents=True)
+        (tools / "downloads" / "cad.tgz").write_bytes(b"x" * 200_000)
+        (tools / "caches" / "pip" / "http" / "blob").write_bytes(b"y" * 100_000)
+        (tools / "opt" / "oss-cad-suite" / "bin" / "verilator").write_text("keep me")
+        old_cache = home / "home" / ".cache" / "uv"
+        old_cache.mkdir(parents=True)
+        (old_cache / "wheel").write_bytes(b"z" * 50_000)
+        # Links the agent could plant to aim the cleanup at your own files.
+        mine = self.s.root / "my-files"
+        mine.mkdir()
+        (mine / "thesis.tex").write_text("precious")
+        os.symlink(mine, tools / "caches" / "pip" / "link-to-mine")
+        npm = home / "home" / ".npm"
+        npm.mkdir()
+        os.symlink(mine, npm / "_cacache")
+
+        report = self.agent("storage").stdout
+        self.assertIn("Temporary files", report)
+        self.assertIn("agent storage clean --temp", report)
+        out = self.agent("storage", "clean", "--temp", "--yes").stdout
+        self.assertIn("tools/downloads", out)
+        self.assertNotIn(".npm", out)  # a link, not a real folder: left alone
+        self.assertIn("removed", out)
+        self.assertEqual(list((tools / "downloads").iterdir()), [])
+        self.assertEqual(list((tools / "caches").iterdir()), [])
+        self.assertEqual(list(old_cache.iterdir()), [])
+        self.assertTrue((tools / "downloads").is_dir())  # folders kept, only emptied
+        self.assertEqual((tools / "opt" / "oss-cad-suite" / "bin" / "verilator").read_text(), "keep me")
+        self.assertEqual((mine / "thesis.tex").read_text(), "precious")
+        self.assertNotIn("builder prune", self.log.read_text())  # build cache only with --build-cache/--all
+        self.assertIn("no temporary files", self.agent("storage", "clean", "--temp", "--yes").stdout)
+
+    def test_clean_all_does_both(self):
+        (self.s.root / "Agent" / "tools" / "caches").mkdir(parents=True)
+        (self.s.root / "Agent" / "tools" / "caches" / "x").write_text("x")
+        self.agent("storage", "clean", "--all", "--yes")
+        self.assertIn("builder prune -f", self.log.read_text())
+        self.assertFalse((self.s.root / "Agent" / "tools" / "caches" / "x").exists())
 
     def test_docker_move_prints_commands(self):
         out = self.agent("storage", "docker-move", "/data/docker").stdout
