@@ -13,6 +13,11 @@ committed to the vault's own git history, so any change can be seen or undone.
   vault rm <note>
   vault tags | lint | index
   vault suggest --hook          UserPromptSubmit hook: lists strongly matching notes, else prints nothing
+
+Hints only come from the current repo's notes and general ones (topics/), and only
+on real evidence: a specific tag, or several keywords. A common word like "tests"
+alone isn't enough. `add` and `update` point out what doesn't belong in a note
+(one-off results, container setup, personal details) as they save it.
 """
 from __future__ import annotations
 
@@ -29,9 +34,30 @@ from pathlib import Path
 VAULT = Path(os.environ.get("AGENT_VAULT", "/vault"))
 SKIP_DIRS = {".git", ".obsidian", ".trash", "templates"}
 SKIP_FILES = {"Index.md", "README.md"}
-MAX_BODY_LINES = 60
+MAX_BODY_LINES = 40
+MAX_BODY_CHARS = 2500
 STALE_DAYS = 180
 SUGGEST_MIN_SCORE = 4
+RECENT = 8
+# Words too common across projects to justify a hint on their own.
+GENERIC = set("""
+test tests testing build builds run runs fix fixes bug bugs code cli docs doc readme setup config debug error errors
+handoff history commit commits branch git file files script scripts tool tools note notes update change changes
+project projects main new old python make makefile
+""".split())
+# Things that don't belong in a note, with why. Checked when saving and by `vault lint`.
+SMELLS = [
+    (re.compile(r"(?i)\bno root\b|--break-system-packages|pip install --target|get-pip\.py|dpkg-deb -x|"
+                r"LD_LIBRARY_PATH|apt-get download|(isn't|is not|not) installed in the (agent )?container|"
+                r"\bscratch(pad)?\b|/tmp/claude"),
+     "container setup: install it into /tools and `tools record` it; the manifest is the record, not a note"),
+    (re.compile(r"(?i)\b\d+(\.\d+)?\s?(mflops|gflops|ms|µs)\b|\b(took|takes|ran in)\s+~?\d|\bresults?:\s"),
+     "looks like results of one run; keep the method and lasting conclusions, not the numbers"),
+    (re.compile(r"(?i)linkedin\.com/in/|(?<![\w.+-])(?!git@)[\w.+-]+@[\w-]+\.[a-z]{2,}\b"),
+     "personal details (profiles, email addresses): keep only what the agent needs to work"),
+    (re.compile(r"(?i)\b(this|the current|today's) (session|chat|task)\b|\bSendUserFile\b"),
+     "about one session; notes should stay true for later ones"),
+]
 STOP = set("""
 a about after again all also an and any are as at be because been before being both but by can
 could did do does doing done each few for from further get got had has have having he her here
@@ -144,6 +170,17 @@ def first_line(body: str) -> str:
     return ""
 
 
+def smells(body: str) -> list[str]:
+    found = []
+    lines = body.count("\n") + 1
+    if lines > MAX_BODY_LINES or len(body) > MAX_BODY_CHARS:
+        found.append(f"long ({lines} lines, {len(body)} characters): split it or keep only what stays true")
+    for rx, why in SMELLS:
+        if rx.search(body):
+            found.append(why)
+    return found
+
+
 # ---------------------------------------------------------------- scoring
 
 def score(n: dict, ts: list[str], project: str, with_body: bool = True) -> int:
@@ -164,6 +201,15 @@ def score(n: dict, ts: list[str], project: str, with_body: bool = True) -> int:
     if s and project and n["project"] == project:
         s += 1
     return s
+
+
+def strong_evidence(n: dict, ts: list[str], tag_use: Counter) -> bool:
+    """A specific tag matched, or at least two different keywords did."""
+    tags = set(n["tags"])
+    parts = {p for t in tags for p in re.split(r"[-_/.]", t) if p} | set(terms(n["title"]))
+    matched = [t for t in ts if t in tags or t in parts]
+    specific = [t for t in matched if t in tags and t not in GENERIC and tag_use[t] <= 2]
+    return bool(specific) or len(set(matched) - GENERIC) >= 2 or len(set(matched)) >= 3
 
 
 def ranked(ts: list[str], project: str, with_body: bool = True) -> list[tuple[int, dict]]:
@@ -216,6 +262,12 @@ def reindex() -> None:
     lines = ["# Vault index", "",
              "Rebuilt by `vault` on every change; don't edit by hand. "
              "Each note's tags are the keywords the agent searches.", ""]
+    everything = [n for g in groups.values() for n in g]
+    recent = sorted((n for n in everything if n["updated"]), key=lambda n: n["updated"], reverse=True)[:RECENT]
+    if recent:
+        lines.append("## Recently updated")
+        lines += [f"- {n['updated']} [[{n['path'][:-3]}|{n['title']}]]" for n in recent]
+        lines.append("")
     for key in sorted(groups, key=lambda k: (k != "", k)):
         lines.append("## General" if not key else f"## Project: {key}")
         for n in sorted(groups[key], key=lambda n: n["title"].lower()):
@@ -302,13 +354,14 @@ def cmd_add(a) -> None:
         for n in similar[:5]:
             print(f"  {n['path']} · {n['title']} [{', '.join(n['tags'])}]")
         sys.exit(2)
-    lines = body.strip("\n").count("\n") + 1
     meta = {"title": a.title, "tags": tags, "project": project, "updated": today(), "verified": a.verified or ""}
     folder.mkdir(parents=True, exist_ok=True)
     path.write_text(render(meta, body), encoding="utf-8")
     reindex()
     commit(f"vault: add {rel}")
-    print(f"saved {rel}" + (f" (long: {lines} lines; aim for under {MAX_BODY_LINES})" if lines > MAX_BODY_LINES else ""))
+    print(f"saved {rel}")
+    for why in smells(body):
+        print(f"  check: {why}")
 
 
 def cmd_update(a) -> None:
@@ -338,6 +391,8 @@ def cmd_update(a) -> None:
     rel = path.relative_to(VAULT).as_posix()
     commit(f"vault: update {rel}")
     print(f"updated {rel}")
+    for why in smells(body):
+        print(f"  check: {why}")
 
 
 def cmd_rm(a) -> None:
@@ -361,9 +416,8 @@ def cmd_lint(_a) -> None:
     for n in all_notes:
         if not n["tags"]:
             problems.append(f"{n['path']}: no tags (unfindable)")
-        lines = n["body"].count("\n") + 1
-        if lines > MAX_BODY_LINES:
-            problems.append(f"{n['path']}: {lines} lines; split or trim")
+        for why in smells(n["body"]):
+            problems.append(f"{n['path']}: {why}")
         try:
             if n["updated"] and dt.date.fromisoformat(n["updated"]) < cutoff:
                 problems.append(f"{n['path']}: not updated since {n['updated']}; re-check or remove")
@@ -374,6 +428,15 @@ def cmd_lint(_a) -> None:
             if x["tags"] and y["tags"] and x["project"] == y["project"]:
                 if len(set(x["tags"]) & set(y["tags"])) / min(len(x["tags"]), len(y["tags"])) >= 0.8:
                     problems.append(f"{x['path']} and {y['path']}: nearly the same tags; merge?")
+    # The same specific tag in several repos is usually general knowledge.
+    projects_by_tag: dict[str, set] = {}
+    for n in all_notes:
+        for t in n["tags"]:
+            if n["project"] and t not in GENERIC:
+                projects_by_tag.setdefault(t, set()).add(n["project"])
+    for t, ps in sorted(projects_by_tag.items()):
+        if len(ps) >= 3 and not any(t in n["tags"] for n in all_notes if not n["project"]):
+            problems.append(f"tag '{t}' in {len(ps)} repos' notes: the shared part may belong in one topics/ note")
     print("\n".join(problems) or f"ok: {len(all_notes)} notes, no problems")
 
 
@@ -393,8 +456,11 @@ def cmd_suggest(a) -> None:
         ts = terms(prompt)
         if not ts:
             return
-        hits = [h for h in ranked(ts, project_from(str(data.get("cwd") or "")), with_body=False)
-                if h[0] >= SUGGEST_MIN_SCORE][:3]
+        project = project_from(str(data.get("cwd") or ""))
+        tag_use = Counter(t for n in notes() for t in n["tags"])
+        hits = [h for h in ranked(ts, project, with_body=False)
+                if h[0] >= SUGGEST_MIN_SCORE and h[1]["project"] in ("", project)
+                and strong_evidence(h[1], ts, tag_use)][:3]
         if hits:
             print("Vault notes matching this prompt (read with `vault show <path>` only if useful):")
             for _, n in hits:

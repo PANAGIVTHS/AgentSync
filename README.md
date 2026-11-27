@@ -147,9 +147,16 @@ Moving things to another disk:
 `~/Agent/vault` is a normal Obsidian vault: open that folder in Obsidian to browse it. The agent writes and maintains it itself with the `vault` tool:
 - **Notes are short and tagged.** Each one is a short Markdown file. Its `tags` (Obsidian tags) are its search keywords.
 - **Lookup by keyword.** `vault find <keywords>` ranks notes by tag, title and text matches, and returns one line per note. The agent reads only the notes it needs.
-- **Automatic hints, cheaply.** A hook checks each prompt against note tags and titles. On a strong match it lists up to 3 note paths, about 20 tokens each. Otherwise it adds nothing.
-- **Kept current.** The agent saves durable lessons at `/handoff`, fixes wrong notes when it finds them, and `vault lint` flags stale, long or duplicate notes.
-- **An index for Obsidian.** `Index.md` is rebuilt on every change.
+- **Automatic hints, cheaply.** A hook checks each prompt against note tags and titles, and lists up to 3 note paths, about 20 tokens each. It only uses notes for the repo you're in plus general ones, and only on real evidence: a specific tag like `verilator`, or several keywords. A common word like "tests" alone isn't enough. Otherwise it adds nothing.
+- **Repo notes and general notes.** `projects/<repo>/` holds facts about one repo. `topics/` holds what's true everywhere (a tool, a language, a technique); `vault lint` suggests one when the same tag turns up in three repos' notes.
+- **Kept clean as it's written.** When the agent saves a note, `vault` points out what doesn't belong in one, and the agent fixes it:
+  - container setup, which belongs in `/tools` and its manifest;
+  - results of a single run;
+  - details about one session;
+  - personal details;
+  - notes that are too long.
+- **Kept current.** The agent saves durable lessons at `/handoff` and fixes wrong notes when it finds them. `vault lint` also flags stale, unfindable or duplicate notes.
+- **An index for Obsidian.** `Index.md` is rebuilt on every change: recently updated notes first, then every note by repo.
 - **History.** Every change is committed to the vault's git history, so you can see or undo anything.
 
 ## Tools the agent installs
