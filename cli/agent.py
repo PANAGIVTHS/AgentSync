@@ -1938,8 +1938,15 @@ def render_help(p: argparse.ArgumentParser) -> None:
     heading(p.prog)
     if p.description and p.prog != "agent":
         emit(Text(p.description))
-    usage = re.sub(r"(?i)^usage:\s*", "", p.format_usage().strip())
-    emit(Text.assemble(("Usage  ", "muted"), (usage, "bold")))
+    # rich-argparse colours the usage with raw escape codes: parse them, or Rich counts them as
+    # characters (the box's right edge comes out short) and their resets wipe the border colour.
+    usage = Text.from_ansi(re.sub(r"\n\s*", " ", p.format_usage().strip()), style="bold")
+    prefix = re.match(r"(?i)usage:\s*", usage.plain)
+    line = Table.grid(padding=(0, 2))
+    line.add_column(style="muted", no_wrap=True)
+    line.add_column(overflow="fold")
+    line.add_row("Usage", usage[prefix.end():] if prefix else usage)
+    emit(line)
 
     def rows(actions):
         g = Table.grid(padding=(0, 2))

@@ -1,4 +1,5 @@
 import importlib.util
+import re
 import sys
 import unittest
 
@@ -50,6 +51,15 @@ class RichOutputTest(unittest.TestCase):
         merge_help = self.agent("merge", "--help").stdout
         self.assertIn("--commit", merge_help)
         self.assertNotIn("--edit", merge_help)  # old spelling still works, but isn't advertised
+
+    def test_help_box_edges_line_up_in_colour(self):
+        # rich-argparse colours the usage with escape codes; they must not count as text width.
+        out = self.s.run(sys.executable, CLI, "pull", "--help", cwd=self.user,
+                         AGENT_PLAIN="0", FORCE_COLOR="1", COLUMNS="80").stdout
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", out)
+        widths = {len(line) for line in plain.splitlines() if line.startswith(("│", "╭", "╰"))}
+        self.assertEqual(len(widths), 1, plain)
+        self.assertNotIn("Usage: ", plain)
 
 
 if __name__ == "__main__":

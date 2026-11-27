@@ -45,7 +45,9 @@ class SupervisorTest(unittest.TestCase):
                     time.sleep(0.1)
                 self.assertTrue({"rc-alpha", "rc-beta"} <= windows())
                 time.sleep(0.3)
-                self.assertIn("remote-control --name alpha", (t / "log").read_text())
+                log = (t / "log").read_text()
+                self.assertIn("remote-control --name alpha", log)
+                self.assertIn("--no-create-session-in-dir", log)  # no empty chat per restart
                 shutil.rmtree(t / "work" / "beta")
                 for _ in range(50):
                     if "rc-beta" not in windows():

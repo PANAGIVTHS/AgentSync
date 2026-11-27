@@ -19,9 +19,10 @@ while true; do
       if ! windows | grep -qxF "rc-$name"; then
         log "starting Remote Control for $name"
         # A persistent server: start new sessions for this repo from claude.ai/code.
+        # --no-create-session-in-dir: don't open an empty chat on every start/reboot.
         # If it exits, the window closes after 30 s and the loop starts it again.
         tmux new-window -d -t "$SESSION" -n "rc-$name" -c "$dir" \
-          "claude remote-control --name '$name' --spawn=same-dir; echo '[remote-control exited; restarting in 30 s]'; sleep 30"
+          "claude remote-control --name '$name' --spawn=same-dir --no-create-session-in-dir; echo '[remote-control exited; restarting in 30 s]'; sleep 30"
       fi
     done
     for w in $(windows | grep '^rc-' || true); do
