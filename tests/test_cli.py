@@ -338,8 +338,16 @@ class CliTest(unittest.TestCase):
         env = (self.agent_home / ".env").read_text()
         self.assertIn(f"AGENT_WORK_DIR='{self.agent_home / 'work'}'", env)
         self.assertEqual((self.agent_home / "compose.yaml").read_text(), (ROOT / "container" / "compose.yaml").read_text())
-        # Re-running keeps the vault and is safe.
+        self.assertIn(f"AGENT_TOOLS_DIR='{self.agent_home / 'tools'}'", env)
+        tools = self.agent_home / "tools"
+        self.assertEqual((tools / "env.sh").read_text(), (ROOT / "tools-template" / "env.sh").read_text())
+        self.assertTrue((tools / "bin").is_dir() and (tools / "manifest.json").is_file())
+        # Re-running keeps the vault and the manifest, and is safe.
+        (tools / "manifest.json").write_text('{"tools": [{"name": "kept"}]}')
         self.agent("setup", "--no-build", "--no-start")
+        self.assertIn("kept", (tools / "manifest.json").read_text())
+        # `agent` alone works without Rich too.
+        self.assertIn("agent checkup", self.agent().stdout)
 
 
 if __name__ == "__main__":

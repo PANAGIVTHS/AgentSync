@@ -8,6 +8,13 @@ You run in a Docker container. The user talks to you from the Claude Code web UI
 - Never push. There are no credentials and pushes are blocked. The user pulls your branches, reviews, merges and pushes.
 - When a request is done, follow the handoff skill yourself: commit, run `agent-task handoff`, write the summary.
 
+## Tools: /tools
+- Missing a program? Check `tools list` first and reuse what's there. Install only into /tools; it's kept across restarts and rebuilds, while anything elsewhere (scratch, /tmp, system folders) is lost or impossible without root.
+- Where things go: programs or launchers in `/tools/bin` (on PATH; it can't replace a system command), toolchains in `/tools/opt/<tool>`, libraries from `.deb`s in `/tools/sysroot/<tool>` used only by that tool's launcher (never a global LD_LIBRARY_PATH), extra settings in `/tools/env.d/<tool>.sh` (quiet, no PATH changes). `pip install --user`, `npm install -g` and `uv tool install` already land in /tools.
+- Downloads: only from the project's official release page over https, verified with its published checksum: `tools fetch <url> --sha256 <hex>`. Never `curl … | sh`. If no checksum is published, `--no-checksum "<why>"`.
+- After every install: `tools record <name> --version V --source <url|pip:pkg|npm:pkg|apt:pkg> --path /tools/… [--sha256 …] --project <repo>`. Run `tools check` if unsure.
+- Container facts like "no root" or "tool X lives in /tools" belong here, not in vault notes.
+
 ## Memory: the vault at /vault
 - Before non-trivial work, run `vault find <keywords>` and read only the notes that matter. A hook may list matching notes under the user's prompt; open them only if useful.
 - At handoff, save what will still be true later (see the vault skill). Fix or delete a note as soon as you find it wrong. Never store secrets.

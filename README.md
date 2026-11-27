@@ -6,6 +6,7 @@ A Claude Code agent that lives in one Docker container on your machine. You give
 Browser / app (claude.ai/code) ──Remote Control──▶ agent container
                                                    /work/<repo>   the agent's clone; task = branch agent/<task>
                                                    /vault         Obsidian memory, searched by keyword
+                                                   /tools         programs it installs, kept across rebuilds
 Your repo ──agent push (automatic after commits)──▶ read-only mirror ──▶ the agent's clone
 Your repo ◀──agent pull (fetches agent/* only)──────────────────────── the agent's clone
 ```
@@ -62,9 +63,11 @@ Sharing:
 
 The repo then shows up in claude.ai/code as `fpga-cam`.
 
+**Chats after a restart.** When the container restarts (`agent restart`, a reboot, an update), Remote Control brings back the chats it was serving, if it was down for less than about 4 hours. Each start also opens one new empty chat; archive it, and archive chats you're done with so they don't come back. Older chats can't be reconnected from the browser, but nothing is lost: the agent's branches, handoffs and vault are on disk, and `agent shell`, then `cd /work/<repo> && claude --resume`, reopens an old conversation (type `/remote-control` in it to use it from the browser again). Before leaving a chat for long, run `/handoff`: a fresh chat continues from the branch, the handoff and the vault.
+
 ## Daily use
 
-In the browser, open the repo and start a session:
+In the browser, open the repo and start a session. Just describe the work: the agent starts a task branch (`agent/<name>`) from your default branch by itself before its first change. The commands below are optional, for when you want to pick the name or the starting branch:
 
 | Type | What happens |
 |---|---|
@@ -107,6 +110,7 @@ Options:
 
 `agent push --wip` also sends everything you haven't committed: edits (staged or not) and new files. Files your `.gitignore` excludes, and secrets like `.env` or `*.key`, are left out. Your files and staging area stay as they are. The agent sees the snapshot as `desktop-wip/<branch>`; tell it to use it. Run it again after more edits. Other commands:
 - `agent list` and `agent doctor` show what's shared and whether everything is healthy.
+- `agent checkup` reports what the agent has been doing and anything risky (see [Checkup](#checkup)).
 - `agent up`, `agent down` and `agent logs` start, stop and show the container.
 - `agent shell` opens a shell inside it.
 - `agent unshare --project NAME` stops sharing a repo.
@@ -124,7 +128,7 @@ Options:
 ## Disk space
 
 `agent storage` shows what takes space, and where:
-- **The agent's data:** repos it works on, mirrors, review copies, its login and the vault, with free space on that disk.
+- **The agent's data:** repos it works on, mirrors, review copies, its login, the vault and its tools, with free space on that disk.
 - **Docker's data:** the agent image, old agent images, the build cache, and the container's own files. Docker keeps these in its own folder (usually `/var/lib/docker`, on your system disk) wherever the agent's data is.
 
 Ways to free space:
@@ -148,13 +152,41 @@ Moving things to another disk:
 - **An index for Obsidian.** `Index.md` is rebuilt on every change.
 - **History.** Every change is committed to the vault's git history, so you can see or undo anything.
 
+## Tools the agent installs
+
+When a task needs a program the image doesn't have (a newer Verilator, `uv`, a JDK, Chromium's libraries), the agent installs it into `/tools`. That's `~/Agent/tools` on your PC: kept across restarts, rebuilds and updates, never shared into your repos, and never run by anything on your PC.
+
+- **Ready in every shell.** `/tools/bin` is on PATH. Bash reads `/tools/env.sh` before every command, which sets `JAVA_HOME` from `jdks/current` and loads per-tool settings from `env.d/`. A new tool needs no Dockerfile or Compose change and works on the agent's next command.
+- **Package managers land there too.** `pip install --user`, `npm install -g` and `uv tool install` install into `/tools`, and their caches live in `/tools/caches`.
+- **Can't replace system commands.** `/tools/bin` comes after the system folders on PATH, so a downloaded program can't stand in for `git` or `python3`.
+- **Rules the agent follows:** reuse before installing; official release pages over https only; verify the published checksum (`tools fetch <url> --sha256 …` refuses a mismatch); never `curl … | sh`; libraries for one program are used only by that program's launcher.
+- **A manifest of everything.** `tools record` writes each install to `/tools/manifest.json`: version, source URL, checksum, size, and which repo needed it. `tools list` shows it. On a new PC the agent can reinstall from it, and `agent checkup` compares the folder with it.
+
+The image itself has `pip` and `venv`. For something every session needs, add the Debian package to `container/packages.txt` instead and run `./install.sh`.
+
+## Checkup
+
+`agent checkup` answers "has the agent done anything odd?". It only reads: nothing from the agent's folders is run, links are never followed, and it doesn't use Claude, so it costs nothing. By default it covers what happened since your last checkup (`--all` for everything).
+
+| Section | What it checks |
+|---|---|
+| Its own settings | Its `settings.json`, `CLAUDE.md` and skills match what `agent setup` installed. Lists skills, plugins, hooks or MCP servers added since. |
+| Git safety | Pushing is still disabled, the commit hook still applies, remotes still point at the read-only mirror, and no commits on branches outside `agent/*`. |
+| Commands it ran | Scans the saved chats for things worth a look: `sudo`, piping a download into a shell, setuid files, pushes, changing git safety settings, skipping hooks, deleting whole folders, editing its own settings, reaching for your PC or network, background processes. |
+| Tools folder | Links pointing outside `/tools`, setuid files, files not in the manifest, installs without a checksum, changes to `env.sh`. |
+| Secrets | Keys and tokens in the vault, handoffs and unmerged agent branches (shown masked). Also lists files in agent branches that your own tools act on by themselves: `.vscode/`, `.claude/`, `.github/workflows/`, `.envrc`, `.gitattributes` and similar. Look at those closely before merging. |
+| Container right now | Processes besides the usual ones, and open network ports. |
+| Activity | Chats, commands, vault notes, handoffs, tools and agent commits in that period. |
+
+✗ marks a problem and makes it exit with an error; ! marks something to look at. Changed settings, git safety settings and `env.sh` are put back by `agent setup --no-build` (it keeps a backup of what it replaces). For tool problems, ask the agent to run `tools check` and fix what it reports.
+
 ## Usage overhead
 
 This setup is designed to cost about the same as using Claude Code normally:
 
 | Added | Cost |
 |---|---|
-| `~/.claude/CLAUDE.md` | About 650 tokens, once per session, cached after |
+| `~/.claude/CLAUDE.md` | About 850 tokens, once per session, cached after |
 | 4 skills | Only their one-line descriptions load until used |
 | Push guard hook | 0 (a script; prints only when it blocks a push) |
 | Vault hint hook | 0 unless a note strongly matches the prompt |
@@ -179,11 +211,15 @@ What keeps sessions cheap:
 
 **Your side.** On your side, git only ever **fetches** from the agent's clone. Nothing executes inside agent-controlled git folders, and the remote has push disabled. `agent review` strips terminal escape codes from text the agent wrote.
 
-**What the agent can reach.** It has full access inside its container: its clones, the vault, and its own Claude settings. The worst case is damage to its own copies. Your repo and GitHub stay untouched.
+**What the agent can reach.** It has full access inside its container: its clones, the vault, its tools, and its own Claude settings, including your Claude login. The worst case is damage to its own copies, or someone using your subscription (`agent login` again replaces the token). Your repo and GitHub stay untouched. It can reach the internet and, like any program on your network, services on your PC or LAN that accept network connections.
+
+**Downloads.** Everything it installs stays in `~/Agent/tools` as plain files. Nothing on your side runs them, and `agent storage` and `agent checkup` never follow links out of that folder. The container runs as your user, not root, so it can't create files that run as root.
+
+**Checking up.** `agent checkup` shows whether any of the above was tampered with, and what the agent ran.
 
 ## Adding tools
 
-Add Debian packages to `container/packages.txt`, then run `./install.sh`. Tools that need more (a host-installed Vivado, licences, devices) will get a proper toolkit format once the first one is needed.
+The agent installs what it needs into `/tools` itself (see [Tools the agent installs](#tools-the-agent-installs)). To bake something into the image instead, add its Debian package to `container/packages.txt` and run `./install.sh`. Tools that need more (a host-installed Vivado, licences, devices) will get a proper toolkit format once the first one is needed.
 
 ## Layout
 
@@ -191,12 +227,13 @@ Add Debian packages to `container/packages.txt`, then run `./install.sh`. Tools 
 cli/agent.py              host CLI (Claude-themed Rich output when available, plain otherwise)
 requirements.txt          Rich + rich-argparse for the CLI's venv
 container/                Dockerfile, compose, packages.txt, gitconfig
-container/bin/            in-container tools: agent-task, vault, quiet, agent-guard, agent-supervisor
+container/bin/            in-container tools: agent-task, vault, tools, quiet, agent-guard, agent-supervisor
 container/githooks/       pre-commit: commits only on agent/* branches
 claude/                   CLAUDE.md, settings.json (hooks), skills: task, handoff, status, vault
 vault-template/           starting vault
+tools-template/           env.sh and README for the agent's /tools folder
 tests/                    python3 -m unittest discover -s tests
-~/Agent/ (per machine)    .env, compose.yaml, home/, work/, mirrors/, handoffs/, vault/, review/
+~/Agent/ (per machine)    .env, compose.yaml, home/, work/, mirrors/, handoffs/, vault/, review/, tools/
 ```
 
 ## Tests

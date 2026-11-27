@@ -1,0 +1,353 @@
+#!/usr/bin/env python3
+"""tools: the agent's permanent tools folder, /tools (standard library only).
+
+Everything the agent installs goes under /tools and is recorded in
+/tools/manifest.json, so you can see what's there, where it came from and
+whether its checksum was checked. `agent checkup` on your PC reads the same
+manifest (by importing this file) and compares it with the folder.
+
+  tools list                                     what's installed
+  tools fetch <https-url> --sha256 HEX           download to /tools/downloads, checksum verified
+  tools fetch <https-url> --no-checksum REASON   when the project publishes no checksum
+  tools record <name> --version V --source SRC --path P [--path P…] [--sha256 HEX | --no-checksum REASON]
+               [--project P] [--note TEXT]       add or update a manifest entry
+  tools rm <name> [--delete]                     forget an entry (and delete its files)
+  tools check                                    unrecorded files, risky links, setuid files
+
+SRC is the https URL it came from, or pip:<package>, npm:<package>, apt:<package>
+(the package manager checks those), or local (built here; say how in --note).
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+from pathlib import Path
+
+CONTAINER_ROOT = "/tools"
+ROOT = Path(os.environ.get("AGENT_TOOLS", CONTAINER_ROOT))
+# Top-level folders whose entries must each be in the manifest. python/ and npm/
+# belong to pip and npm, caches/ and downloads/ are disposable.
+RECORDED_AREAS = ("bin", "opt", "jdks", "sysroot", "env.d")
+EXEMPT = {"jdks/current", "bin/.gitkeep"}
+LAYOUT = ("bin", "opt", "jdks", "sysroot", "env.d", "python", "npm", "downloads", "caches")
+# Where a link inside /tools may point (inside the container). Anything else,
+# e.g. a home folder, could be followed by a program on your PC.
+LINK_OK = ("/tools/", "/usr/", "/bin/", "/sbin/", "/lib/", "/lib32/", "/lib64/", "/etc/", "/opt/agent/")
+NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,63}\Z")
+SHA_RE = re.compile(r"[0-9a-fA-F]{64}\Z")
+MANAGED_SOURCES = ("pip:", "npm:", "apt:")
+
+
+def die(msg: str) -> None:
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+# ---------------------------------------------------------------- paths
+
+def container_path(root: Path, real: Path) -> str:
+    rel = os.path.relpath(real, root)
+    return CONTAINER_ROOT if rel == "." else f"{CONTAINER_ROOT}/{rel}"
+
+
+def real_path(root: Path, cpath: str) -> Path | None:
+    """/tools/x/y -> <root>/x/y; None if it isn't inside /tools."""
+    norm = os.path.normpath(cpath)
+    if norm == CONTAINER_ROOT:
+        return root
+    if not norm.startswith(CONTAINER_ROOT + "/"):
+        return None
+    return root / norm[len(CONTAINER_ROOT) + 1:]
+
+
+def link_target_ok(link_cpath: str, target: str) -> bool:
+    absolute = target if target.startswith("/") else os.path.join(os.path.dirname(link_cpath), target)
+    absolute = os.path.normpath(absolute)
+    return absolute == CONTAINER_ROOT or any(absolute.startswith(p) for p in LINK_OK)
+
+
+def walk(top: Path):
+    """Every path under top, never following links."""
+    for dirpath, dirnames, filenames in os.walk(top, followlinks=False):
+        for n in dirnames + filenames:
+            yield Path(dirpath) / n
+
+
+def disk_size(path: Path) -> int:
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return 0
+    total = st.st_blocks * 512
+    if stat.S_ISDIR(st.st_mode):
+        for p in walk(path):
+            try:
+                total += os.lstat(p).st_blocks * 512
+            except OSError:
+                pass
+    return total
+
+
+# ---------------------------------------------------------------- manifest
+
+def read_manifest(root: Path) -> tuple[list[dict], str]:
+    """(entries, problem). Refuses a manifest that is a link (it could point anywhere)."""
+    f = root / "manifest.json"
+    try:
+        st = os.lstat(f)
+    except FileNotFoundError:
+        return [], ""
+    if not stat.S_ISREG(st.st_mode):
+        return [], "manifest.json isn't a regular file"
+    try:
+        data = json.loads(f.read_text())
+        entries = data.get("tools", [])
+        if not isinstance(entries, list) or not all(isinstance(e, dict) for e in entries):
+            raise ValueError
+    except (ValueError, AttributeError):
+        return [], "manifest.json isn't valid"
+    return entries, ""
+
+
+def write_manifest(root: Path, entries: list[dict]) -> None:
+    entries = sorted(entries, key=lambda e: e.get("name", ""))
+    tmp = root / ".manifest.json.tmp"
+    tmp.write_text(json.dumps({"tools": entries}, indent=2) + "\n")
+    os.replace(tmp, root / "manifest.json")
+
+
+def verified(e: dict) -> bool:
+    return bool(e.get("sha256")) or str(e.get("source", "")).startswith(MANAGED_SOURCES)
+
+
+# ---------------------------------------------------------------- scan (also used by `agent checkup`)
+
+def scan(root: Path) -> dict:
+    found = {"problem": "", "unrecorded": [], "unverified": [], "missing": [], "links": [], "setuid": [],
+             "size": 0, "entries": []}
+    try:
+        if not stat.S_ISDIR(os.lstat(root).st_mode):
+            found["problem"] = f"{root} isn't a folder"
+            return found
+    except FileNotFoundError:
+        return found
+    entries, found["problem"] = read_manifest(root)
+    found["entries"] = entries
+    paths = [os.path.normpath(str(p)) for e in entries for p in e.get("paths", []) if isinstance(p, str)]
+    for e in entries:
+        if not verified(e):
+            found["unverified"].append(f"{e.get('name', '?')} (from {e.get('source', '?')})")
+        for p in e.get("paths", []):
+            rp = real_path(root, str(p))
+            if rp is None or not os.path.lexists(rp):
+                found["missing"].append(f"{e.get('name', '?')}: {p}")
+    for area in RECORDED_AREAS:
+        d = root / area
+        if not d.is_dir() or d.is_symlink():
+            continue
+        for child in sorted(d.iterdir()):
+            rel = f"{area}/{child.name}"
+            c = f"{CONTAINER_ROOT}/{rel}"
+            if rel in EXEMPT:
+                continue
+            if not any(c == p or c.startswith(p + "/") or p.startswith(c + "/") for p in paths):
+                found["unrecorded"].append(c)
+    total = 0
+    for p in walk(root):
+        try:
+            st = os.lstat(p)
+        except OSError:
+            continue
+        total += st.st_blocks * 512
+        c = container_path(root, p)
+        if stat.S_ISLNK(st.st_mode):
+            target = os.readlink(p)
+            if not link_target_ok(c, target):
+                found["links"].append(f"{c} -> {target}")
+        elif stat.S_ISREG(st.st_mode) and st.st_mode & (stat.S_ISUID | stat.S_ISGID):
+            found["setuid"].append(c)
+    found["size"] = total
+    return found
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_list(_a) -> None:
+    entries, problem = read_manifest(ROOT)
+    if problem:
+        die(problem)
+    if not entries:
+        print("no tools recorded yet")
+        return
+    for e in sorted(entries, key=lambda e: e.get("name", "")):
+        missing = any(not os.path.lexists(real_path(ROOT, p) or "/nonexistent") for p in e.get("paths", []))
+        flags = ("" if verified(e) else "  UNVERIFIED") + ("  MISSING FILES" if missing else "")
+        proj = f" [{e['project']}]" if e.get("project") else ""
+        print(f"{e.get('name')} {e.get('version', '')}{proj}  {human(e.get('size', 0))}  {e.get('source', '')}{flags}")
+        for p in e.get("paths", []):
+            print(f"    {p}")
+
+
+def human(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.0f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+def sha256_of(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def cmd_fetch(a) -> None:
+    if not a.url.startswith("https://"):
+        die("download only over https:// (from the project's official release page)")
+    if not a.sha256 and not a.no_checksum:
+        die("pass --sha256 HEX from the release page, or --no-checksum REASON if it publishes none")
+    if a.sha256 and not SHA_RE.fullmatch(a.sha256):
+        die("--sha256 must be 64 hex characters")
+    name = a.name or os.path.basename(a.url.split("?", 1)[0].rstrip("/"))
+    if not name or "/" in name or name.startswith("."):
+        die("can't tell the file name; pass --name")
+    dest_dir = ROOT / "downloads"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest, part = dest_dir / name, dest_dir / f".{name}.part"
+    p = subprocess.run(["curl", "-fL", "--proto", "=https", "--proto-redir", "=https", "--tlsv1.2",
+                        "--retry", "2", "-sS", "-o", str(part), a.url])
+    if p.returncode:
+        part.unlink(missing_ok=True)
+        die(f"download failed (curl exit {p.returncode})")
+    digest = sha256_of(part)
+    if a.sha256 and digest.lower() != a.sha256.lower():
+        part.unlink(missing_ok=True)
+        die(f"checksum mismatch: expected {a.sha256.lower()}, got {digest}. Deleted the download; "
+            "don't retry with --no-checksum")
+    os.replace(part, dest)
+    print(f"saved {container_path(ROOT, dest)} ({human(dest.stat().st_size)})")
+    print(f"sha256 {digest}" + ("" if a.sha256 else "  (not verified: no published checksum)"))
+    print(f"next: unpack into /tools/opt/<tool>, then `tools record <tool> --source {a.url} "
+          + (f"--sha256 {digest}" if a.sha256 else "--no-checksum '<reason>'") + " --path …`")
+
+
+def cmd_record(a) -> None:
+    if not NAME_RE.fullmatch(a.name):
+        die("invalid name: letters, digits and . _ + -")
+    src = a.source
+    if not (src.startswith("https://") or src.startswith(MANAGED_SOURCES) or src == "local"):
+        die("--source must be an https:// URL, pip:<pkg>, npm:<pkg>, apt:<pkg> or local")
+    if src.startswith("https://") and not (a.sha256 or a.no_checksum):
+        die("an https download needs --sha256 HEX (what `tools fetch` printed) or --no-checksum REASON")
+    if src == "local" and not a.note:
+        die("for --source local, say in --note how it was built")
+    if a.sha256 and not SHA_RE.fullmatch(a.sha256):
+        die("--sha256 must be 64 hex characters")
+    paths = []
+    for p in a.path:
+        cp = os.path.normpath(p if p.startswith("/") else os.path.join(CONTAINER_ROOT, p))
+        rp = real_path(ROOT, cp)
+        if rp is None or cp == CONTAINER_ROOT:
+            die(f"{p} isn't inside {CONTAINER_ROOT}: install only into {CONTAINER_ROOT}")
+        if not os.path.lexists(rp):
+            die(f"{cp} doesn't exist")
+        paths.append(cp)
+    entries, problem = read_manifest(ROOT)
+    if problem:
+        die(problem)
+    old = next((e for e in entries if e.get("name") == a.name), {})
+    entry = {"name": a.name, "version": a.version, "source": src, "sha256": (a.sha256 or "").lower(),
+             "no_checksum": a.no_checksum or "", "paths": sorted(set(paths)),
+             "size": sum(disk_size(real_path(ROOT, p)) for p in paths),
+             "installed": old.get("installed") or dt.date.today().isoformat(),
+             "updated": dt.date.today().isoformat(), "project": a.project or old.get("project", ""),
+             "note": a.note or old.get("note", "")}
+    write_manifest(ROOT, [e for e in entries if e.get("name") != a.name] + [entry])
+    print(f"{'updated' if old else 'recorded'} {a.name} {a.version} ({human(entry['size'])})"
+          + ("" if verified(entry) else "  UNVERIFIED: no checksum"))
+
+
+def cmd_rm(a) -> None:
+    entries, problem = read_manifest(ROOT)
+    if problem:
+        die(problem)
+    entry = next((e for e in entries if e.get("name") == a.name), None)
+    if not entry:
+        die(f"no tool named {a.name!r}; see `tools list`")
+    if a.delete:
+        for p in entry.get("paths", []):
+            rp = real_path(ROOT, p)
+            if rp is None or rp == ROOT:
+                continue
+            if rp.is_symlink() or rp.is_file():
+                rp.unlink(missing_ok=True)
+            elif rp.is_dir():
+                shutil.rmtree(rp)
+    write_manifest(ROOT, [e for e in entries if e is not entry])
+    print(f"removed {a.name}" + (" and its files" if a.delete else " from the manifest (files kept)"))
+
+
+def cmd_check(_a) -> None:
+    r = scan(ROOT)
+    bad = False
+    if r["problem"]:
+        print(f"✗ {r['problem']}")
+        bad = True
+    for key, label, is_bad in (("links", "link pointing outside /tools", True),
+                               ("setuid", "setuid/setgid file (not needed by normal tools)", True),
+                               ("unrecorded", "not in the manifest: `tools record` it, or delete it", False),
+                               ("unverified", "installed without a checksum", False),
+                               ("missing", "in the manifest but missing: reinstall or `tools rm`", False)):
+        for item in r[key]:
+            print(f"{'✗' if is_bad else '!'} {label}: {item}")
+            bad = bad or is_bad
+    if not any(r[k] for k in ("links", "setuid", "unrecorded", "unverified", "missing")) and not r["problem"]:
+        print(f"ok: {len(r['entries'])} tools, {human(r['size'])}")
+    sys.exit(1 if bad else 0)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(prog="tools", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("list").set_defaults(fn=cmd_list)
+    s = sub.add_parser("fetch")
+    s.add_argument("url")
+    s.add_argument("--sha256")
+    s.add_argument("--no-checksum", metavar="REASON")
+    s.add_argument("--name", help="file name to save as")
+    s.set_defaults(fn=cmd_fetch)
+    s = sub.add_parser("record")
+    s.add_argument("name")
+    s.add_argument("--version", required=True)
+    s.add_argument("--source", required=True)
+    s.add_argument("--path", action="append", required=True)
+    s.add_argument("--sha256")
+    s.add_argument("--no-checksum", metavar="REASON")
+    s.add_argument("--project")
+    s.add_argument("--note")
+    s.set_defaults(fn=cmd_record)
+    s = sub.add_parser("rm")
+    s.add_argument("name")
+    s.add_argument("--delete", action="store_true")
+    s.set_defaults(fn=cmd_rm)
+    sub.add_parser("check").set_defaults(fn=cmd_check)
+    a = ap.parse_args()
+    for d in LAYOUT:
+        if ROOT.is_dir():
+            (ROOT / d).mkdir(exist_ok=True)
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()
