@@ -623,7 +623,8 @@ TRAILER = re.compile(r"(?im)^(co-authored-by|claude-session|signed-off-by|genera
 
 
 def squash_message(src: Path, task: str, base: str, sha: str) -> str:
-    subjects = [s for s in out(src, "log", "--reverse", "--no-merges", "--format=%s", f"{base}..{sha}").splitlines()
+    span = [f"{base}..{sha}"] if base else ["-1", sha]
+    subjects = [s for s in out(src, "log", "--reverse", "--no-merges", "--format=%s", *span).splitlines()
                 if s and not s.startswith("wip: autosave")]
     if len(subjects) == 1:
         text = subjects[0] + "\n"
@@ -634,8 +635,8 @@ def squash_message(src: Path, task: str, base: str, sha: str) -> str:
 
 
 # Never sent in a WIP snapshot, even when .gitignore doesn't cover them.
-SECRET_EXCLUDES = tuple(f":(exclude,glob)**/{p}" for p in
-                        (".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx", "id_rsa*", "id_ed25519*"))
+SECRET_FILES = (".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx", "id_rsa*", "id_ed25519*")
+SECRET_EXCLUDES = tuple(f":(exclude,glob)**/{p}" for p in SECRET_FILES)
 
 
 def wip_snapshot(src: Path, branch: str) -> tuple[str, int]:
@@ -702,8 +703,55 @@ def require_task(src: Path, task: str) -> str:
     return ref
 
 
+def overwrite_with(name: str, src: Path, task: str) -> None:
+    """Make your files exactly match agent/<task>, whatever either history looks like.
+    Your previous uncommitted work is saved first, so this is never a dead end."""
+    settle(src, name)
+    fetch_agent(src)
+    ref = require_task(src, task)
+    sha = out(src, "rev-parse", ref)
+    heading(f"Overwrite with agent/{task}")
+    _, patch = close_review(src, name, task)
+    if patch:
+        note(f"Your review-copy edits are saved in {patch}")
+
+    branch = out(src, "branch", "--show-current") or "detached"
+    backup, _ = wip_snapshot(src, branch)          # works mid-merge and includes new files
+    if backup:
+        backup_ref = f"refs/agent-backup/{time.strftime('%Y%m%d-%H%M%S')}"
+        git(src, "update-ref", backup_ref, backup)
+
+    for f in (AGENT_HOME / "pending" / name).glob("*.json") if (AGENT_HOME / "pending" / name).is_dir() else ():
+        f.unlink()                                  # any half-finished `agent merge` is replaced by this
+    git(src, "reset", "--quiet")                    # leaves files alone; clears merge state and staging
+    git(src, "read-tree", "--reset", "-u", sha)     # files and staging area = the agent's version
+    git(src, "clean", "-fdq", *[x for p in SECRET_FILES for x in ("-e", p)])  # drop your other new files
+
+    if out(src, "rev-parse", "HEAD^{tree}") == out(src, "rev-parse", f"{sha}^{{tree}}"):
+        ok(f"your branch already matches agent/{task}; nothing to change")
+    else:
+        mb = git(src, "merge-base", "HEAD", sha, check=False)
+        message = squash_message(src, task, mb.stdout.strip() if mb.returncode == 0 else "", sha)
+        git_path(src, "SQUASH_MSG").write_text(message)
+        pf = pending_file(name, task)
+        pf.parent.mkdir(parents=True, exist_ok=True)
+        pf.write_text(json.dumps({"task": task, "sha": sha, "head": out(src, "rev-parse", "HEAD")}) + "\n")
+        ok(f"your files now match agent/{task} exactly; the differences are staged, not committed")
+        note("Check them in VS Code and commit. The message is pre-filled:")
+        panel(message.strip(), "Commit message")
+    if backup:
+        note("Your previous uncommitted work is saved. To get it back:")
+        hint("Restore", f"git restore --source={backup_ref} --worktree -- .")
+    hint("To undo", "git reset --hard" + (f"   (then the Restore command above)" if backup else ""))
+
+
 def cmd_pull(a) -> None:
     name, src = resolve_project(a.project)
+    if a.overwrite:
+        if not a.task:
+            raise Fail("say which task to overwrite with: agent pull <task> --overwrite")
+        overwrite_with(name, src, normalize_task(a.task))
+        return
     settle(src, name)
     fetch_agent(src)
     tasks = agent_tasks(src)
@@ -784,7 +832,12 @@ def cmd_review(a) -> None:
     if a.base == "HEAD" and marker and is_ancestor(src, marker, ref) and marker != out(src, "rev-parse", ref):
         base, label = marker, "what's new since you last merged it"
     else:
-        base, label = out(src, "merge-base", a.base, ref), f"against {a.base}"
+        mb = git(src, "merge-base", a.base, ref, check=False)
+        if mb.returncode:  # unrelated histories: compare with your branch as it is
+            base = out(src, "rev-parse", a.base)
+            label = f"no shared history with your branch; showing how it differs from {a.base}"
+        else:
+            base, label = mb.stdout.strip(), f"against {a.base}"
     heading(f"Review agent/{task}  ({label} @ {base[:9]})")
     hand = handoff_of(name, task)
     if hand.exists():
@@ -865,7 +918,11 @@ def cmd_merge(a) -> None:
         conflicts = git(src, "apply", "--3way", "--whitespace=nowarn", diff, check=False).returncode != 0
         diff.unlink()
     else:
-        base = out(src, "merge-base", "HEAD", sha)
+        mb = git(src, "merge-base", "HEAD", sha, check=False)
+        if mb.returncode:
+            raise Fail(f"agent/{task} doesn't share any history with your branch (the agent rewrote it), "
+                       f"so it can't be merged. To make your files match it exactly: agent pull {task} --overwrite")
+        base = mb.stdout.strip()
         conflicts = git(src, "merge", "--squash", ref, check=False).returncode != 0
     message = squash_message(src, task, base, sha)
     git_path(src, "SQUASH_MSG").write_text(message)
@@ -1985,6 +2042,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(fn=cmd_push)
 
     s = sub.add_parser("pull", help="fetch the agent's branches into your repo")
+    s.add_argument("task", nargs="?", help="with --overwrite: the task to take (Tab completes it)")
+    s.add_argument("--overwrite", action="store_true",
+                   help="make your files exactly match the task's branch, discarding your uncommitted "
+                        "changes (they're saved first)")
     s.set_defaults(fn=cmd_pull)
 
     s = sub.add_parser("review", help="show a task's handoff and open its changes in VS Code")

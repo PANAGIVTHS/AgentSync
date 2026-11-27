@@ -93,6 +93,7 @@ Then commit in VS Code (or `git commit`) and `git push`, from your account.
 Options:
 - `agent merge <task> --commit` stages and commits in one go, with the pre-filled message.
 - `agent merge <task> --merge` does a real git merge instead, if you ever want the agent's own commits in your history.
+- `agent pull <task> --overwrite` makes your files exactly match the agent's branch and stages the difference, whatever state your repo is in. Use it for uncommitted changes you don't care about, a merge that went wrong, or a task where the agent rewrote history, which `agent merge` can't handle. Your previous uncommitted work is saved first, and the command prints how to restore it; secret files like `.env` are never deleted.
 
 **After you've taken a task.** Once you commit, the task shows as `merged` in `agent pull`. If you give the agent follow-up work on the same task:
 - it continues from your latest commit, so nothing is offered twice;

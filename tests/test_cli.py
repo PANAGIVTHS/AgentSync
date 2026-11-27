@@ -246,6 +246,69 @@ class CliTest(unittest.TestCase):
         self.share()
         self.assertNotEqual(self.agent("merge", "x", "--commit", "--merge", check=False).returncode, 0)
 
+    def agent_rebuilds_history(self, task, files):
+        """Plays the agent: a branch with no history in common with yours."""
+        work = self.agent_home / "work" / "myrepo"
+        self.s.git(work, "switch", "-q", "--orphan", f"agent/{task}")
+        self.s.git(work, "rm", "-rq", "--cached", "--ignore-unmatch", ".")
+        for f in list(work.iterdir()):
+            if f.name != ".git":
+                (f.unlink() if f.is_file() else __import__("shutil").rmtree(f))
+        for rel, text in files.items():
+            (work / rel).parent.mkdir(parents=True, exist_ok=True)
+            (work / rel).write_text(text)
+        self.s.git(work, "add", "-A")
+        self.s.git(work, "commit", "-q", "-m", "Rebuild history")
+
+    def test_unrelated_history_merge_explains_overwrite(self):
+        self.share()
+        self.agent_rebuilds_history("rebuild-history", {"src/a.txt": "new\n"})
+        p = self.agent("merge", "rebuild-history", check=False)
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("agent pull rebuild-history --overwrite", p.stderr)
+        self.assertIn("no shared history", self.agent("review", "rebuild-history", "--no-open").stdout)
+
+    def test_pull_overwrite_takes_the_agents_files_exactly(self):
+        self.share()
+        self.agent_rebuilds_history("rebuild-history", {"src/a.txt": "agent\n", "src/b.txt": "b\n"})
+        # Your mess: a staged file, an edit, a deletion, a new file, and a secret.
+        (self.user / "staged.txt").write_text("staged\n")
+        self.s.git(self.user, "add", "staged.txt")
+        (self.user / "src" / "a.txt").write_text("mine\n")
+        (self.user / "loose.txt").write_text("loose\n")
+        (self.user / ".env").write_text("TOKEN=1\n")
+        out = self.agent("pull", "rebuild-history", "--overwrite").stdout
+        self.assertIn("match agent/rebuild-history exactly", out)
+        files = sorted(str(p.relative_to(self.user)) for p in self.user.rglob("*")
+                       if p.is_file() and ".git" not in p.parts)
+        self.assertEqual(files, [".env", "src/a.txt", "src/b.txt"])        # your .env is never deleted
+        self.assertEqual((self.user / "src" / "a.txt").read_text(), "agent\n")
+        self.assertEqual(self.s.git(self.user, "diff", "--name-only").stdout, "")  # all staged
+        self.s.git(self.user, "commit", "-q", "--no-edit")
+        self.assertEqual(self.last_commit("%s").strip(), "Rebuild history")
+        self.assertEqual(len(self.last_commit("%P").split()), 1)
+        self.assertIn("merged", self.agent("pull").stdout)
+        # Your old work was saved and can be restored.
+        backup = self.s.git(self.user, "for-each-ref", "--format=%(refname)", "refs/agent-backup/").stdout.split()
+        self.assertEqual(len(backup), 1)
+        self.s.git(self.user, "restore", f"--source={backup[0]}", "--worktree", "--", ".")
+        self.assertEqual((self.user / "src" / "a.txt").read_text(), "mine\n")
+        self.assertEqual((self.user / "loose.txt").read_text(), "loose\n")
+
+    def test_pull_overwrite_replaces_a_half_finished_merge(self):
+        self.share()
+        self.agent_commit("agent/x", "src/a.txt", "agent\n")
+        (self.user / "src" / "a.txt").write_text("user\n")
+        self.s.git(self.user, "commit", "-q", "-am", "user edit")
+        self.assertEqual(self.agent("merge", "x", check=False).returncode, 1)   # conflict
+        self.agent("pull", "x", "--overwrite")
+        self.assertEqual((self.user / "src" / "a.txt").read_text(), "agent\n")
+        self.assertEqual(self.s.git(self.user, "diff", "--name-only", "--diff-filter=U").stdout, "")
+
+    def test_pull_overwrite_needs_a_task(self):
+        self.share()
+        self.assertIn("say which task", self.agent("pull", "--overwrite", check=False).stderr)
+
     def test_unshare_cleans_up(self):
         self.share()
         self.agent_commit("agent/x", "src/a.txt", "agent\n")
