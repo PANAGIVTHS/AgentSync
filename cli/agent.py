@@ -492,14 +492,198 @@ def push_mirror(src: Path, name: str) -> None:
             "refs/heads/*:refs/heads/*", "refs/tags/*:refs/tags/*")
 
 
+# ---------------------------------------------------------------- secrets
+# Files and folders the agent never gets. They're listed in your repo's private
+# exclude file (.git/info/exclude), which works like .gitignore but isn't part of
+# the repo, so nothing changes in your files or on GitHub. Git then never commits
+# them, so they never reach the mirror, and `agent push --wip` leaves them out too.
+# What's already committed is a different matter: it's in your history, which the
+# agent has. Ignoring can't take it back, so we say so.
+
+SECRETS_BEGIN = "# >>> agent secrets (managed by `agent secrets`) >>>"
+SECRETS_END = "# <<< agent secrets <<<"
+JUNK_BEGIN = "# >>> agent share: caches and build output >>>"
+JUNK_END = "# <<< agent share <<<"
+# Caches and build output that a shared plain folder shouldn't commit.
+JUNK = ("node_modules/", "__pycache__/", "*.pyc", ".venv/", "venv/", ".ipynb_checkpoints/", ".cache/",
+        ".pytest_cache/", ".mypy_cache/", ".DS_Store", "Thumbs.db", "*.swp", "*~")
+BIG_FILE = 50 * 1024 * 1024
+SECRET_NAMES = re.compile(
+    r"(^|/)(\.env(\.(?!example$|sample$|template$|dist$)[^/]+)?|[^/]*\.(pem|key|p12|pfx|jks|keystore|kdbx|ppk|tfvars)|"
+    r"id_(rsa|dsa|ecdsa|ed25519)[^/]*|[^/]*credentials[^/]*\.(json|ya?ml|ini|txt)|[^/]*service[-_]account[^/]*\.json|"
+    r"secrets?\.(json|ya?ml|toml|ini|env|txt)|\.npmrc|\.pypirc|\.netrc|\.git-credentials|\.htpasswd|"
+    r"terraform\.tfstate(\.backup)?|\.aws/credentials|\.docker/config\.json)$|(^|/)\.(ssh|aws|gnupg)/$", re.I)
+
+
+def exclude_file(src: Path) -> Path:
+    return git_path(src, "info/exclude")
+
+
+def read_block(path: Path, begin: str, end: str) -> list[str]:
+    text = path.read_text() if path.exists() else ""
+    if begin not in text:
+        return []
+    body = text.split(begin, 1)[1].split(end, 1)[0]
+    return [line for line in body.splitlines() if line.strip() and not line.startswith("#")]
+
+
+def write_block(path: Path, begin: str, end: str, lines: list[str]) -> None:
+    text = path.read_text() if path.exists() else ""
+    if begin in text:
+        before, rest = text.split(begin, 1)
+        after = rest.split(end, 1)[1] if end in rest else ""
+        text = before.rstrip("\n") + ("\n" if before.strip() else "") + after.lstrip("\n")
+    if lines:
+        text = text.rstrip("\n") + ("\n\n" if text.strip() else "") + "\n".join([begin, *lines, end]) + "\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+
+
+def to_pattern(rel: str, is_dir: bool) -> str:
+    """A repo-relative path as an exclude pattern matching exactly it."""
+    escaped = re.sub(r"([*?\[\]\\!# ])", r"\\\1", rel.strip("/"))
+    return "/" + escaped + ("/" if is_dir else "")
+
+
+def from_pattern(pattern: str) -> str:
+    return re.sub(r"\\(.)", r"\1", pattern.strip("/"))
+
+
+def repo_relative(src: Path, path: str) -> str:
+    """A path the user typed (relative to where they are) as a path inside the repo."""
+    absolute = Path(os.path.abspath(os.path.expanduser(path)))
+    try:
+        rel = absolute.relative_to(src)
+    except ValueError:
+        raise Fail(f"{path} isn't inside {src}")
+    if not rel.parts or rel.parts[0] == ".git":
+        raise Fail(f"{path}: pick a file or folder inside the repo")
+    return rel.as_posix()
+
+
+def ever_committed(src: Path, rel: str) -> bool:
+    if git(src, "rev-parse", "-q", "--verify", "HEAD", check=False).returncode:
+        return False
+    return bool(git(src, "log", "--all", "--format=%h", "-1", "--", rel, check=False).stdout.strip())
+
+
+def tracked(src: Path, rel: str) -> bool:
+    return bool(git(src, "ls-files", "--", rel, check=False).stdout.strip())
+
+
+def folder_files(top: Path, limit: int = 20000) -> list[str]:
+    """Files under a plain folder (relative), skipping junk folders and never following links."""
+    junk_dirs = {j.rstrip("/") for j in JUNK if j.endswith("/")} | {".git"}
+    found = []
+    for dirpath, dirnames, filenames in os.walk(top, followlinks=False):
+        dirnames[:] = sorted(d for d in dirnames if d not in junk_dirs)
+        for n in sorted(filenames):
+            found.append((Path(dirpath) / n).relative_to(top).as_posix())
+            if len(found) >= limit:
+                return found
+    return found
+
+
+def secret_candidates(top: Path, files: list[str]) -> tuple[list[str], list[str]]:
+    """(paths that look secret by name, 'path:line kind' for files that contain something key-like)."""
+    names, contents = [], []
+    dirs_seen = set()
+    for rel in files:
+        parts = rel.split("/")
+        for i in range(1, len(parts)):
+            d = "/".join(parts[:i]) + "/"
+            if d not in dirs_seen and SECRET_NAMES.search(d):
+                dirs_seen.add(d)
+                names.append(d)
+        if any(rel.startswith(d) for d in dirs_seen):
+            continue
+        if SECRET_NAMES.search(rel):
+            names.append(rel)
+            continue
+        p = top / rel
+        try:
+            if p.is_symlink() or p.stat().st_size > 1024 * 1024:
+                continue
+            text = p.read_text(errors="strict")
+        except (OSError, UnicodeDecodeError, ValueError):
+            continue
+        contents += [f"{rel}:{n}  {what}" for n, what in find_secrets(text)[:1]]
+    return names, contents
+
+
+def secrets_of(src: Path) -> list[str]:
+    return [from_pattern(p) for p in read_block(exclude_file(src), SECRETS_BEGIN, SECRETS_END)]
+
+
+def set_secrets(src: Path, paths: list[str]) -> None:
+    unique = {p.rstrip("/"): p.endswith("/") or (src / p).is_dir() for p in paths}
+    lines = [to_pattern(p, is_dir) for p, is_dir in sorted(unique.items())]
+    write_block(exclude_file(src), SECRETS_BEGIN, SECRETS_END, lines)
+
+
+def cmd_secrets(a) -> None:
+    if a.project:
+        name, src = resolve_project(a.project)
+    else:
+        top = git(Path.cwd(), "rev-parse", "--show-toplevel", check=False).stdout.strip()
+        if not top:
+            raise Fail("not inside a repo. Run this inside the repo, or pass --project NAME")
+        src, name = Path(top).resolve(), ""
+    current = secrets_of(src)
+    if a.action in ("add", "rm") and not a.paths:
+        raise Fail(f"say which files or folders: agent secrets {a.action} PATH …  (Tab completes them)")
+    rels = [repo_relative(src, p) for p in a.paths]
+    if a.action == "add":
+        committed_now = [r for r in rels if tracked(src, r)]
+        if committed_now and not a.untrack:
+            raise Fail("already committed, so ignoring them changes nothing: " + ", ".join(committed_now)
+                       + "\nAdd --untrack to also stop tracking them (staged; you commit it). "
+                         "They stay in your earlier history, which the agent already has.")
+        for r in committed_now:
+            git(src, "rm", "-r", "--cached", "--quiet", "--", r)
+        set_secrets(src, current + rels)
+        heading("Secrets")
+        for r in rels:
+            ok(f"kept from the agent: {r}" + ("  (untracked; commit to finish)" if r in committed_now else ""))
+        earlier = [r for r in rels if ever_committed(src, r)]
+        if earlier:
+            warn("these were committed before, so they're in your history and the agent's copy of it: "
+                 + ", ".join(earlier) + ". If they hold passwords or keys, change them.")
+    elif a.action == "rm":
+        unknown = [r for r in rels if r.rstrip("/") not in {c.rstrip("/") for c in current}]
+        if unknown:
+            raise Fail("not in the secrets list: " + ", ".join(unknown))
+        set_secrets(src, [c for c in current if c.rstrip("/") not in {r.rstrip("/") for r in rels}])
+        heading("Secrets")
+        for r in rels:
+            ok(f"no longer a secret: {r} (it can be committed and shared again)")
+    else:
+        heading("Secrets" + (f" of {name}" if name else ""))
+        if not current:
+            note("None yet. Add some: agent secrets add PATH …  (Tab completes them)")
+        rows = []
+        for c in current:
+            state = ("missing", "muted") if not (src / c).exists() else (
+                ("committed earlier: still in history", "warn") if ever_committed(src, c) else ("kept out", "ok"))
+            rows.append([c, state])
+        if rows:
+            table(["Path", "State"], rows)
+        note(f"Stored in {tilde(exclude_file(src))}: works like .gitignore, but isn't part of your repo.")
+
+
+# ---------------------------------------------------------------- share
+
 def cmd_share(a) -> None:
     path = Path(a.path).expanduser().resolve()
+    if not path.is_dir():
+        raise Fail(f"not a folder: {path}")
     p = git(path, "rev-parse", "--show-toplevel", check=False)
-    if p.returncode:
-        raise Fail(f"not a git repository: {path}")
-    src = Path(p.stdout.strip()).resolve()
+    plain = p.returncode != 0
+    src = path if plain else Path(p.stdout.strip()).resolve()
     if src == AGENT_HOME or AGENT_HOME in src.parents:
         raise Fail(f"refusing to share a folder inside {AGENT_HOME}")
+    if plain and (src == Path.home().resolve() or src == Path(src.anchor) or src in Path.home().resolve().parents):
+        raise Fail(f"refusing to share {src}: pick a project folder, not your whole home folder")
     name = a.name or re.sub(r"[^A-Za-z0-9_-]+", "-", src.name).strip("-")
     if not NAME_RE.fullmatch(name):
         raise Fail(f"invalid project name {name!r}: use letters, digits, - and _ (pass --name)")
@@ -511,22 +695,70 @@ def cmd_share(a) -> None:
             raise Fail(f"this repo is already shared as {other!r}")
     if mirror_of(name).exists() or work_of(name).exists():
         raise Fail(f"leftover data for {name!r} in {AGENT_HOME}; remove it or pick another --name")
-    branches = out(src, "for-each-ref", "--format=%(refname:short)", "refs/heads").splitlines()
-    if not branches:
-        raise Fail("the repo has no commits yet. Make a first commit, then share")
-    current = git(src, "symbolic-ref", "-q", "--short", "HEAD", check=False).stdout.strip()
-    default = current if current in branches else next(
-        (b for b in ("main", "master") if b in branches), branches[0])
-    if git(src, "remote", "get-url", "agent", check=False).returncode == 0:
-        raise Fail("this repo already has a remote named 'agent'. Remove or rename it first")
-    hooks_ok = not a.no_hooks and hooks_dir(src) is not None
+    if plain:
+        branches, default = [], "main"
+        files = folder_files(src)
+    else:
+        branches = out(src, "for-each-ref", "--format=%(refname:short)", "refs/heads").splitlines()
+        if not branches:
+            raise Fail("the repo has no commits yet. Make a first commit, then share")
+        current = git(src, "symbolic-ref", "-q", "--short", "HEAD", check=False).stdout.strip()
+        default = current if current in branches else next(
+            (b for b in ("main", "master") if b in branches), branches[0])
+        if git(src, "remote", "get-url", "agent", check=False).returncode == 0:
+            raise Fail("this repo already has a remote named 'agent'. Remove or rename it first")
+        files = [f for f in out(src, "ls-files", "-co", "--exclude-standard").splitlines() if f]
+
+    chosen = []
+    for s in a.secret or []:
+        rel = repo_relative(src, s)
+        if not (src / rel).exists():
+            raise Fail(f"--secret {s}: no such file or folder")
+        chosen.append(rel + ("/" if (src / rel).is_dir() else ""))
+    found, contents = secret_candidates(src, files)
+    found = [f for f in found if not any(f == c or f.startswith(c) for c in chosen)]
+    secrets = chosen + ([] if a.no_detect else found)
+    big = [] if not plain else [f for f in files if not any(f.startswith(s) for s in secrets)
+                                and (src / f).is_file() and not (src / f).is_symlink()
+                                and (src / f).stat().st_size > BIG_FILE]
+    in_history = [] if plain else [s for s in secrets if tracked(src, s) or ever_committed(src, s)]
+    hooks_ok = not a.no_hooks and (plain or hooks_dir(src) is not None)
 
     heading(f"Share {name}")
-    kv([["Your repo", (str(src), "path")],
-                     ["Branches", f"{len(branches)} (default {default}); committed history only"],
-                     ["Agent clone", (f"/work/{name} in the container", "path")],
-                     ["Stored in", (str(AGENT_HOME), "path")]])
-    heading("Changes to your repo")
+    if not plain and path != src:
+        warn(f"{path} is inside the repo {src}; sharing shares that whole repo")
+    rows = [["Your folder" if plain else "Your repo", (str(src), "path")]]
+    if plain:
+        shared = [f for f in files if not any(f == s or f.startswith(s) for s in secrets) and f not in big]
+        rows.append(["Files", f"{len(shared)} to share, as the first commit of a new local git repo"])
+    else:
+        rows.append(["Branches", f"{len(branches)} (default {default}); committed history only"])
+    rows += [["Agent clone", (f"/work/{name} in the container", "path")], ["Stored in", (str(AGENT_HOME), "path")]]
+    kv(rows)
+    heading("Kept from the agent")
+    if secrets:
+        for s in secrets:
+            bullet("-", s + ("" if s in chosen else "  (looks secret)"), "warn")
+    if plain:
+        bullet("-", "caches and build output: " + ", ".join(JUNK[:6]) + " …", "muted")
+        for f in big:
+            bullet("-", f"{f}  (over {human(BIG_FILE)})", "muted")
+    if not secrets and not plain:
+        note("Nothing extra: only what git already commits. Add files with --secret PATH (Tab completes).")
+    note("Listed in .git/info/exclude: works like .gitignore, but doesn't change your files or your repo.")
+    if in_history:
+        warn("already committed, so the agent will see them in your history: " + ", ".join(in_history)
+             + ". Excluding can't take that back. If they hold passwords or keys, change them, "
+             "or remove them from the history before sharing.")
+    unlisted = [c for c in contents if not any(c.startswith(s) for s in secrets)]
+    if unlisted:
+        warn("these files contain something that looks like a key or token:")
+        for c in unlisted[:8]:
+            note(f"    {c}")
+        note("  If they're real, keep them out with --secret PATH (and change the key if it was committed).")
+    heading("Changes to your " + ("folder" if plain else "repo"))
+    if plain:
+        bullet("+", "make it a git repo (local only: no remote, nothing goes to GitHub), with one first commit")
     bullet("+", "remote 'agent' (fetch only; pushing to it is disabled)")
     if hooks_ok:
         bullet("+", "hooks post-commit, post-merge, post-rewrite: auto-send your commits")
@@ -538,6 +770,19 @@ def cmd_share(a) -> None:
         _say(OUT, "", ("\n", ""), "Dry run. Re-run with --yes to share.", "warn")
         return
 
+    if plain:
+        if not out(Path.home(), "config", "--get", "user.name") or not out(Path.home(), "config", "--get", "user.email"):
+            raise Fail("git doesn't know your name yet, needed for the first commit. Run:\n"
+                       "git config --global user.name 'Your Name' && git config --global user.email you@example.com")
+        run(["git", "init", "--quiet", src])
+        git(src, "symbolic-ref", "HEAD", f"refs/heads/{default}")
+        write_block(exclude_file(src), JUNK_BEGIN, JUNK_END, list(JUNK) + [to_pattern(f, False) for f in big])
+        set_secrets(src, secrets)
+        git(src, "add", "--all")
+        git(src, "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "--allow-empty", "-m", "Shared with the agent")
+        branches = [default]
+    elif secrets:
+        set_secrets(src, secrets_of(src) + secrets)
     for d in dirs().values():
         d.mkdir(parents=True, exist_ok=True)
     mirror, work = mirror_of(name), work_of(name)
@@ -560,10 +805,15 @@ def cmd_share(a) -> None:
         shutil.rmtree(mirror, ignore_errors=True)
         shutil.rmtree(work, ignore_errors=True)
         raise
-    reg[name] = {"source": str(src), "hooks": bool(hooks)}
+    reg[name] = {"source": str(src), "hooks": bool(hooks), **({"made_repo": True} if plain else {})}
     save_registry(reg)
     ok(f"shared {name}. It appears in claude.ai/code as '{name}' within ~15 s (if the container is up).")
+    if plain:
+        note("It's a git repo now: commit in VS Code (or `git commit -am …`) and the agent gets your changes; "
+             "`agent push --wip` sends uncommitted ones.")
     note(f"First time only: `agent attach`, open window rc-{name}, and accept the folder trust prompt.")
+    if secrets:
+        hint("Change what's kept out later", "agent secrets add|rm PATH")
 
 
 # ---------------------------------------------------------------- merge records
@@ -986,6 +1236,8 @@ def cmd_unshare(a) -> None:
         pending = [t for t in agent_tasks(src) if task_state(src, name, t) != "merged"]
     heading(f"Unshare {name}")
     say("Deletes the mirror, the agent's clone and handoffs; removes the remote and hooks from your repo.")
+    if load_registry().get(name, {}).get("made_repo"):
+        note("The folder stays a git repo (with your history). Delete its .git folder yourself if you don't want that.")
     if pending:
         warn(f"unmerged agent branches will be lost: {', '.join(pending)}")
     if not a.yes:
@@ -2286,6 +2538,8 @@ def complete_values(act: argparse.Action, words: list[str]) -> list[tuple[str, s
         return [(n, i["source"], "project") for n, i in sorted(load_registry().items())]
     if dest in ("path", "target", "home"):
         return [(":dirs", "", "")]
+    if dest in ("secret", "paths"):
+        return [(":files", "", "")]
     proj = _project_for(words)
     if not proj:
         return []
@@ -2328,6 +2582,8 @@ def complete(words: list[str]) -> list[tuple[str, str, str]]:
     positionals = [x for x in parser._actions if not x.option_strings and x.nargs != argparse.SUPPRESS]
     if positional < len(positionals):
         found += complete_values(positionals[positional], words)
+    elif positionals and positionals[-1].nargs in ("*", "+"):
+        found += complete_values(positionals[-1], words)  # any number of paths
     return found
 
 
@@ -2541,7 +2797,7 @@ def cmd_update(a) -> None:
 
 COMMAND_GROUPS = (
     ("Daily", ("pull", "review", "merge", "push")),
-    ("Repos", ("share", "unshare", "list")),
+    ("Repos", ("share", "secrets", "unshare", "list")),
     ("Container", ("up", "down", "restart", "logs", "attach", "shell", "login")),
     ("This machine", ("setup", "update", "doctor", "checkup", "storage", "completion")),
 )
@@ -2685,9 +2941,14 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--no-install", action="store_true", help="update the files only; run install.sh yourself later")
     s.set_defaults(fn=cmd_update)
 
-    s = sub.add_parser("share", help="give the agent a repo (dry run unless --yes)")
-    s.add_argument("path", nargs="?", default=".", help="the repo to share (default: the one you're in)")
+    s = sub.add_parser("share", help="give the agent a repo or a folder (dry run unless --yes)")
+    s.add_argument("path", nargs="?", default=".",
+                   help="the repo or folder to share (default: where you are). A plain folder becomes a local git repo")
     s.add_argument("--name", help="project name (default: folder name)")
+    s.add_argument("--secret", action="append", metavar="PATH",
+                   help="keep this file or folder from the agent (repeat it; Tab completes)")
+    s.add_argument("--no-detect", action="store_true",
+                   help="don't add files that look secret (.env, keys, credentials) automatically")
     s.add_argument("--yes", action="store_true", help="actually share")
     s.add_argument("--no-hooks", action="store_true", help="don't install auto-push hooks")
     s.set_defaults(fn=cmd_share)
@@ -2721,6 +2982,15 @@ def build_parser() -> argparse.ArgumentParser:
     # Older spellings of the default behaviour.
     mode.add_argument("--squash", "--edit", action="store_true", dest="legacy", help=argparse.SUPPRESS)
     s.set_defaults(fn=cmd_merge)
+
+    s = sub.add_parser("secrets", help="files and folders the agent never gets: list, add or remove them")
+    s.add_argument("action", nargs="?", choices=["list", "add", "rm"], default="list",
+                   help="list (default), add or rm")
+    s.add_argument("paths", nargs="*", metavar="PATH", help="files or folders in the repo (Tab completes)")
+    s.add_argument("--untrack", action="store_true",
+                   help="with add: also stop tracking files that are already committed")
+    s.add_argument("--project", help="shared repo name (default: the repo you're in)")
+    s.set_defaults(fn=cmd_secrets)
 
     s = sub.add_parser("unshare", help="stop sharing a repo and delete the agent's copy")
     s.add_argument("--yes", action="store_true", help="don't ask for confirmation")

@@ -47,7 +47,7 @@ agent update --claude    # also upgrade Claude Code inside the image
 
 Your login, vault and shared repos are kept.
 
-## Share a repo
+## Share a repo or a folder
 
 ```bash
 agent share ~/Projects/fpga-cam          # dry run: shows exactly what it will do
@@ -63,7 +63,26 @@ Sharing:
 
 The repo then shows up in claude.ai/code as `fpga-cam`.
 
-**Chats after a restart.** When the container restarts (`agent restart`, a reboot, an update), Remote Control brings back the chats it was serving, if it was down for less than about 4 hours. Each start also opens one new empty chat; archive it, and archive chats you're done with so they don't come back. Older chats can't be reconnected from the browser, but nothing is lost: the agent's branches, handoffs and vault are on disk, and `agent shell`, then `cd /work/<repo> && claude --resume`, reopens an old conversation (type `/remote-control` in it to use it from the browser again). Before leaving a chat for long, run `/handoff`: a fresh chat continues from the branch, the handoff and the vault.
+**A plain folder works too.** If the folder isn't a git repo, `agent share` makes it one: local only, with no remote, so nothing goes to GitHub. It commits the folder's files as a first commit, leaving out caches and build output (`node_modules/`, `__pycache__/`, `.venv/`, …) and files over 50 MB. From then on it works like any shared repo: commit (in VS Code, or `git commit -am …`) and the agent gets your changes, or send uncommitted ones with `agent push --wip`. `agent unshare` leaves the folder as a git repo; delete its `.git` folder if you don't want that.
+
+### Secrets
+
+Some files the agent should never get: `.env` files, keys, credentials, private notes.
+
+- **Found for you.** `agent share` looks for files that are secret by name (`.env`, `*.pem`, `*.key`, `id_rsa`, `credentials.json`, `secrets.yaml`, `.npmrc`, `.ssh/`, …) and keeps them out. Its dry run lists them, so you can check. `--no-detect` turns that off.
+- **Your own choice.** `--secret PATH`, repeated as often as you like, keeps out any file or folder. Tab completes the paths.
+- **Keys inside ordinary files.** The dry run also warns about files that *contain* something that looks like a key or token, such as `config.py` with an API key in it, so you can add them.
+- **Changed later** with `agent secrets` (Tab completes paths):
+
+  ```bash
+  agent secrets                    # list them, and whether each is kept out
+  agent secrets add .env private/  # keep these out
+  agent secrets rm private/        # share it again
+  ```
+
+They're listed in your repo's private exclude file, `.git/info/exclude`. It works like `.gitignore`, but isn't part of the repo, so nothing changes in your files or on GitHub. Git then never commits them, so they never reach the agent, and `agent push --wip` leaves them out too.
+
+**What's already committed can't be taken back.** Excluding a file stops it being committed from now on. If it was committed before, it's in your history, and the agent has that history. `agent share` and `agent secrets add` warn you when that's the case. For a file that's still tracked, `agent secrets add PATH --untrack` also stops tracking it; that's staged, for you to commit. If such a file holds a password or key, change it.
 
 ## Daily use
 
@@ -113,6 +132,7 @@ Options:
 - `agent checkup` reports what the agent has been doing and anything risky (see [Checkup](#checkup)).
 - `agent up`, `agent down` and `agent logs` start, stop and show the container.
 - `agent shell` opens a shell inside it.
+- `agent secrets` lists, adds or removes files the agent never gets (see [Secrets](#secrets)).
 - `agent unshare --project NAME` stops sharing a repo.
 
 ## Tab completion
